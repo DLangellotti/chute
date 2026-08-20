@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Conversation tests: drive the bot against a fake Telegram, no network."""
+import re
 import shutil
 import sys
 import tempfile
@@ -15,7 +16,11 @@ chute.STATE_PATH = root.parent / "state.json"
 chute.LOG_PATH = root.parent / "chute.log"
 OWNER = CHAT = 555
 
-sent, edits, edit_kb, mid = [], [], [], [100]
+sent, edits, edit_kb, edit_ids, mid = [], [], [], [], [100]
+edit_fails = [False]          # simulate Telegram refusing to edit an old message
+
+DATED = re.compile(
+    r"\d{4}-\d{2}-\d{2} \d{4} (Image|Document|Audio|Video|Note)( \d+)?\.\w+$")
 
 
 class FakeTelegram:
@@ -31,9 +36,12 @@ class FakeTelegram:
         return {"message_id": mid[0]}
 
     def edit(self, chat, m, text, keyboard=None):
+        if edit_fails[0]:
+            return None       # too old for Telegram to edit
+        edit_ids.append(m)
         edits.append(text)
         edit_kb.append(keyboard)
-        return {}
+        return {"message_id": m}
 
     def ack(self, cid, text=None):
         pass
@@ -44,8 +52,11 @@ class FakeTelegram:
 
 
 chute.Telegram = FakeTelegram
-cfg = make_config(root)
-bot = chute.Bot(cfg)
+bot = chute.Bot(make_config(root))
+
+INBOX = root / "Inbox"
+WORK = root / "Work/Attachments"
+PERSONAL = root / "Personal/Attachments"
 
 
 def photo(n, caption=None, group=None):
@@ -70,260 +81,240 @@ def text(n, body, uid=OWNER):
                                         "from": {"id": uid}, "text": body}}
 
 
-def tap(n, data):
+def tap(n, data, message_id=None):
+    """A button press. Defaults to the newest message, or name an older one."""
     return {"update_id": n, "callback_query": {
         "id": "c%d" % n, "from": {"id": OWNER}, "data": data,
-        "message": {"message_id": mid[0], "chat": {"id": CHAT}}}}
+        "message": {"message_id": message_id if message_id is not None
+                    else mid[0], "chat": {"id": CHAT}}}}
 
 
-import re as _re
+def arrive(update, on=bot):
+    """Deliver a message and return the id of the confirmation it produced."""
+    on.handle(update)
+    return mid[0]
 
-DATED = _re.compile(r"\d{4}-\d{2}-\d{2} \d{4} (Image|Document|Audio|Video|Note)( \d+)?\.\w+$")
 
 def snap(folder):
     return set(folder.glob("*")) if folder.is_dir() else set()
+
 
 def added(folder, before):
     return sorted(set(snap(folder)) - before)
 
 
-section("keyboard is built from config")
-bot.handle(photo(1, caption="q3 pricing table"))
-keys = [b["callback_data"] for row in sent[-1][1] for b in row]
-labels = [b["text"] for row in sent[-1][1] for b in row]
-check("one button per destination", keys[:3],
-      ["b:inbox", "b:work", "b:personal"])
-check("labels come from config", labels[:3],
-      ["📥 Inbox", "📡 Work", "🏠 Personal"])
-check("only discard appended", keys[-1], "b:__cancel")
-check("no custom-path button", "b:__custom" in keys, False)
-check("no repeat button either", any(k.startswith("q:") for k in keys), False)
-
-section("image, tap, filed at once")
-check("asked where it goes", "Where does this go?" in sent[-1][0], True)
-before = snap(root / "Work/Attachments")
-bot.handle(tap(2, "b:work"))
-got = added(root / "Work/Attachments", before)
-check("one file appeared, no name prompt", len(got), 1)
-check("the caption named the file", got[0].name, "q3 pricing table.jpg")
-check("confirmed in place with the path", got[0].name in edits[-1], True)
-check("nothing ever asked for a name",
-      any("Name it" in e for e in edits), False)
-check("staging left clean", list(chute.STAGING.iterdir()), [])
-
-section("a captionless photo names the same way")
-bot.handle(photo(4))
-before = snap(root / "Personal/Attachments")
-bot.handle(tap(5, "b:personal"))
-got = added(root / "Personal/Attachments", before)
-check("one file appeared", len(got), 1)
-check("dated Image name", got[0].name.endswith(" Image.jpg") and
-      bool(DATED.match(got[0].name)), True)
-
-section("text after filing is a new item, not a name")
-bot.handle(text(6, "Kitchen tiles"))
-check("it queued as its own note", "Where does this go?" in sent[-1][0], True)
-bot.handle(text(7, "/cancel"))
-
-section("album queues, repeat button files fast")
-sent.clear(); edits.clear()
-for n in (10, 11, 12):
-    bot.handle(photo(n, group="G1"))
-check("only one prompt for three photos",
-      sum("Where does this go?" in s[0] for s in sent), 1)
-check("waiting count updates to 1", "1 more waiting" in edits[0], True)
-check("waiting count updates to 2", "2 more waiting" in edits[-1], True)
-for n in (13, 14, 15):
-    bot.handle(tap(n, "b:work"))
-check("all three filed by three taps",
-      len(list((root / "Work/Attachments").glob("*.jpg"))), 4)
-check("queue drained", bot.chat_state(CHAT)["queue"], [])
-
-section("link capture becomes a note")
-bot.handle(text(20, "https://example.com/blog/some-article"))
-bot.handle(tap(21, "b:work"))
-notes = list((root / "Work/Inbox").glob("*.md"))
-check("routed to the by_kind text folder", len(notes), 1)
-check("link kept in the body",
-      "example.com/blog/some-article" in notes[0].read_text(), True)
-
-section("a stale custom-path tap does nothing")
-bot.handle(photo(30, caption="still here"))
-bot.handle(tap(31, "b:__custom"))
-check("old keyboard button is ignored",
-      bot.chat_state(CHAT)["active"] is not None, True)
-before = snap(root / "Work/Attachments")
-bot.handle(tap(32, "b:work"))
-check("a real tap still files it",
-      len(added(root / "Work/Attachments", before)), 1)
-
-section("blocked extensions")
-before = len(list(root.rglob("*")))
-bot.handle(document(38, "installer.app"))
-check("blocked file refused", "blocked for safety" in sent[-1][0], True)
-check("nothing staged for it", list(chute.STAGING.iterdir()), [])
-check("nothing written", len(list(root.rglob("*"))), before)
-
-section("discard, cancel, authorisation")
-bot.handle(photo(40))
-check("staged while pending", len(list(chute.STAGING.iterdir())), 1)
-bot.handle(tap(41, "b:__cancel"))
-check("discard cleans staging", list(chute.STAGING.iterdir()), [])
-for n in (42, 43, 44):
-    bot.handle(photo(n))
-bot.handle(text(45, "/cancel"))
-check("cancel clears queue and staging",
-      (bot.chat_state(CHAT)["queue"], list(chute.STAGING.iterdir())), ([], []))
-check("cancel reports the count", "Cleared 3 item(s)" in sent[-1][0], True)
-count_before = len(list(root.rglob("*.jpg")))
-bot.handle(photo(50))
-sent.clear()
-bot.handle(text(51, "steal", uid=999))
-check("stranger gets no reply at all", sent, [])
-check("stranger wrote nothing", len(list(root.rglob("*.jpg"))), count_before)
-bot.handle(text(52, "/cancel"))
-
-section("help lists the configured folders")
-bot.handle(text(55, "/help"))
-check("help names a destination", "📡 Work" in sent[-1][0], True)
-check("help shows its path", "Work/Attachments" in sent[-1][0], True)
-
-section("restart mid-flow")
-sent.clear()
-bot.handle(photo(61, caption="half done"))
-bot.persist()
-resumed = chute.Bot(make_config(root))
-sent.clear()
-resumed.recover()
-check("re-prompts after restart",
-      "Picking up where we left off" in sent[-1][0], True)
-before = snap(root / "Personal/Attachments")
-resumed.handle(tap(62, "b:personal"))
-check("still files after restart",
-      len(added(root / "Personal/Attachments", before)), 1)
-
-section("status")
-resumed.handle(text(70, "/status"))
-check("reports idle", "Nothing in progress." in sent[-1][0], True)
-check("reports the root", str(root) in sent[-1][0], True)
-
 def keys_of(keyboard):
     return [b["callback_data"] for row in keyboard or [] for b in row]
 
 
-# The restart section left this instance holding an item its twin already
-# filed, so clear it before driving the flow again.
-bot.handle(text(79, "/cancel"))
+def labels_of(keyboard):
+    return [b["text"] for row in keyboard or [] for b in row]
 
-section("undo a filing")
-sent.clear(); edits.clear(); edit_kb.clear()
-bot.handle(photo(91, caption="undo me"))
-before = snap(root / "Work/Attachments")
-bot.handle(tap(92, "b:work"))
-new = added(root / "Work/Attachments", before)
-filed = new[0] if new else root / "Work/Attachments/missing"
-check("filed to begin with", filed.exists(), True)
-check("confirmation offers undo", keys_of(edit_kb[-1]), ["z:last"])
-bot.handle(tap(94, "z:last"))
-check("the file is out of the tree again", filed.exists(), False)
-check("and back in staging", len(list(chute.STAGING.iterdir())), 1)
-check("re-prompted for a folder", "Where does this go?" in sent[-1][0], True)
-before = snap(root / "Personal/Attachments")
-bot.handle(tap(95, "b:personal"))
-refiled_new = added(root / "Personal/Attachments", before)
-check("refiled where the second answer said", len(refiled_new), 1)
-check("staging clean again", list(chute.STAGING.iterdir()), [])
 
-bot.handle(text(97, "/undo"))
-check("the refiling can be undone as well", refiled_new[0].exists(), False)
-bot.handle(text(98, "/undo"))
-check("but the same filing cannot be undone twice",
-      "Nothing to undo" in sent[-1][0], True)
-bot.handle(text(99, "/cancel"))
-check("cancel clears what undo put back",
-      (bot.chat_state(CHAT)["queue"], list(chute.STAGING.iterdir())), ([], []))
+section("the keyboard is every folder, plus delete")
+first = arrive(photo(1, caption="q3 pricing table"))
+keys = keys_of(sent[-1][1])
+check("one button per folder", keys[:3], ["b:inbox", "b:work", "b:personal"])
+check("delete is the last button", keys[-1], "b:__delete")
+check("the folder it is in is marked",
+      labels_of(sent[-1][1])[0], "• 📥 Inbox")
+check("the others are not", labels_of(sent[-1][1])[1], "📡 Work")
 
-section("undo a note")
-bot.handle(text(100, "https://example.com/undo-note"))
-before = snap(root / "Work/Inbox")
-bot.handle(tap(101, "b:work"))
-new_notes = added(root / "Work/Inbox", before)
-check("one dated note written", len(new_notes) == 1 and
-      bool(DATED.match(new_notes[0].name)), True)
-note = new_notes[0]
-bot.handle(text(103, "/undo"))
-check("note removed again", note.exists(), False)
-before = snap(root / "Work/Inbox")
-bot.handle(tap(104, "b:work"))
-renotes = added(root / "Work/Inbox", before)
-check("the same note can be filed again", len(renotes), 1)
-note = renotes[0]
-check("the link survived the round trip",
-      "example.com/undo-note" in note.read_text(), True)
+section("arrival files it with no tap at all")
+check("it is already in the landing folder",
+      (INBOX / "q3 pricing table.jpg").exists(), True)
+check("the reply names where it went",
+      "Inbox/q3 pricing table.jpg" in sent[-1][0], True)
+check("and says it is filed", sent[-1][0].startswith("Filed"), True)
+check("nothing was left staged", list(chute.STAGING.iterdir()), [])
+check("nothing was ever asked", any("Where does this go" in s[0] for s in sent),
+      False)
 
-section("undo keeps its hands off a changed file")
-bot.handle(photo(110, caption="edited later"))
-before = snap(root / "Work/Attachments")
-bot.handle(tap(111, "b:work"))
-edited = added(root / "Work/Attachments", before)[0]
-edited.write_bytes(b"SOMEONE ELSE CHANGED THIS")
-bot.handle(text(113, "/undo"))
-check("an edited file is left where it is", edited.exists(), True)
-check("and the reason is given", "changed since I filed it" in sent[-1][0], True)
+section("a captionless item names itself by date and type")
+before = snap(INBOX)
+arrive(photo(2))
+got = added(INBOX, before)
+check("one file appeared", len(got), 1)
+check("named by date, time and type", bool(DATED.match(got[0].name)), True)
 
-bot.handle(photo(114, caption="moved later"))
-before = snap(root / "Work/Attachments")
-bot.handle(tap(115, "b:work"))
-moved = added(root / "Work/Attachments", before)[0]
-moved.rename(root / "Work/moved by hand.jpg")
-bot.handle(text(117, "/undo"))
-check("a file that walked off is not chased",
-      (root / "Work/moved by hand.jpg").exists(), True)
-check("and that is said plainly", "not where I left it" in sent[-1][0], True)
+section("a tap moves it")
+bot.handle(tap(3, "b:work", message_id=first))
+check("gone from the landing folder",
+      (INBOX / "q3 pricing table.jpg").exists(), False)
+check("arrived in the tapped folder",
+      (WORK / "q3 pricing table.jpg").exists(), True)
+check("the message says it moved", edits[-1].startswith("Moved"), True)
+check("and names the new path", "Work/Attachments/q3 pricing table.jpg"
+      in edits[-1], True)
+check("the buttons stay live", keys_of(edit_kb[-1])[:3],
+      ["b:inbox", "b:work", "b:personal"])
+check("now marking the folder it sits in", labels_of(edit_kb[-1])[1],
+      "• 📡 Work")
 
-section("undo survives a restart")
-bot.handle(photo(120, caption="restart undo"))
-before = snap(root / "Work/Attachments")
-bot.handle(tap(121, "b:work"))
-last = added(root / "Work/Attachments", before)[0]
+section("a second tap moves it again")
+bot.handle(tap(4, "b:personal", message_id=first))
+check("moved on", (PERSONAL / "q3 pricing table.jpg").exists(), True)
+check("and left the last folder", (WORK / "q3 pricing table.jpg").exists(),
+      False)
+bot.handle(tap(5, "b:inbox", message_id=first))
+check("including back where it started",
+      (INBOX / "q3 pricing table.jpg").exists(), True)
+
+section("tapping the folder it is already in changes nothing")
+count_before = len(list(INBOX.glob("q3 pricing table*.jpg")))
+bot.handle(tap(6, "b:inbox", message_id=first))
+check("no second copy appears",
+      len(list(INBOX.glob("q3 pricing table*.jpg"))), count_before)
+check("and it is still there", (INBOX / "q3 pricing table.jpg").exists(), True)
+
+section("an album is one file and one message each")
+before = snap(INBOX)
+ids = [arrive(photo(n, group="G1")) for n in (10, 11, 12)]
+check("three files landed with no taps", len(added(INBOX, before)), 3)
+check("each got its own message", len(set(ids)), 3)
+check("nothing mentions waiting",
+      any("more waiting" in s[0] for s in sent), False)
+for n, one in zip((13, 14, 15), ids):
+    bot.handle(tap(n, "b:work", message_id=one))
+check("each moves independently", len(added(INBOX, before)), 0)
+
+section("a link becomes a note, and moves by its target's routing")
+before = snap(INBOX)
+note_id = arrive(text(20, "https://example.com/blog/some-article"))
+notes = added(INBOX, before)
+check("the note landed in the landing folder", len(notes), 1)
+check("as markdown", notes[0].suffix, ".md")
+check("with the link in it",
+      "example.com/blog/some-article" in notes[0].read_text(), True)
+bot.handle(tap(21, "b:work", message_id=note_id))
+check("moving it follows the target's by_kind route",
+      len(list((root / "Work/Inbox").glob("*.md"))), 1)
+
+section("blocked file types never reach the disk")
+before = snap(INBOX)
+bot.handle(document(30, "installer.app"))
+check("refused", "blocked for safety" in sent[-1][0], True)
+check("nothing landed", added(INBOX, before), [])
+check("nothing staged", list(chute.STAGING.iterdir()), [])
+
+section("delete removes the file")
+doomed = arrive(photo(40, caption="delete me"))
+check("filed first", (INBOX / "delete me.jpg").exists(), True)
+bot.handle(tap(41, "b:__delete", message_id=doomed))
+check("the file is gone", (INBOX / "delete me.jpg").exists(), False)
+check("the message says so", "Deleted" in edits[-1], True)
+check("and loses its buttons", edit_kb[-1], None)
+bot.handle(tap(42, "b:work", message_id=doomed))
+check("a later tap has nothing to act on",
+      "no longer have a record" in edits[-1], True)
+
+section("delete keeps its hands off a changed file")
+edited = arrive(photo(50, caption="edited later"))
+(INBOX / "edited later.jpg").write_bytes(b"SOMEONE ELSE CHANGED THIS")
+bot.handle(tap(51, "b:__delete", message_id=edited))
+check("the file survives", (INBOX / "edited later.jpg").exists(), True)
+check("and the reason is given", "changed since I filed it" in edits[-1], True)
+
+section("a move does not chase a file that walked off")
+strayed = arrive(photo(60, caption="moved by hand"))
+(INBOX / "moved by hand.jpg").rename(root / "elsewhere.jpg")
+bot.handle(tap(61, "b:work", message_id=strayed))
+check("it is left alone", (root / "elsewhere.jpg").exists(), True)
+check("and that is said plainly", "not where I left it" in edits[-1], True)
+
+section("an edited file can still be moved")
+cropped = arrive(photo(65, caption="cropped in place"))
+(INBOX / "cropped in place.jpg").write_bytes(b"EDITED BUT STILL MINE")
+bot.handle(tap(66, "b:work", message_id=cropped))
+check("the move goes ahead", (WORK / "cropped in place.jpg").exists(), True)
+check("carrying the new contents",
+      (WORK / "cropped in place.jpg").read_bytes(), b"EDITED BUT STILL MINE")
+
+section("stale and unknown buttons")
+live = arrive(photo(70, caption="still here"))
+bot.handle(tap(71, "b:__custom", message_id=live))
+check("an unknown button does nothing",
+      (INBOX / "still here.jpg").exists(), True)
+bot.handle(tap(72, "b:work", message_id=live))
+check("a real button still works", (WORK / "still here.jpg").exists(), True)
+bot.handle(tap(73, "b:work", message_id=999999))
+check("a tap on a message we have forgotten says so",
+      "no longer have a record" in edits[-1], True)
+
+section("a message too old to edit gets a fresh one")
+old = arrive(photo(80, caption="ancient"))
+edit_fails[0] = True
+sent.clear()
+bot.handle(tap(81, "b:work", message_id=old))
+check("the move still happened", (WORK / "ancient.jpg").exists(), True)
+check("and a new message reports it", len(sent), 1)
+check("naming the new path", "Work/Attachments/ancient.jpg" in sent[-1][0],
+      True)
+new_id = mid[0]
+edit_fails[0] = False
+bot.handle(tap(82, "b:personal", message_id=new_id))
+check("the new message is the live handle now",
+      (PERSONAL / "ancient.jpg").exists(), True)
+bot.handle(tap(83, "b:inbox", message_id=old))
+check("and the old one is dead", "no longer have a record" in edits[-1], True)
+
+section("only the owner may move or delete")
+mine = arrive(photo(90, caption="mine"))
+sent.clear()
+bot.handle(text(91, "steal", uid=999))
+check("a stranger gets no reply", sent, [])
+stranger_tap = {"update_id": 92, "callback_query": {
+    "id": "c92", "from": {"id": 999}, "data": "b:work",
+    "message": {"message_id": mine, "chat": {"id": CHAT}}}}
+bot.handle(stranger_tap)
+check("and cannot move the owner's file", (INBOX / "mine.jpg").exists(), True)
+
+section("help names the folders and the landing one")
+bot.handle(text(100, "/help"))
+check("it lists a folder", "📡 Work" in sent[-1][0], True)
+check("it marks where things land", "← lands here" in sent[-1][0], True)
+check("it admits it sleeps", "while my computer is awake" in sent[-1][0], True)
+
+section("retired commands point at the buttons")
+for n, cmd in ((101, "/undo"), (102, "/cancel"), (103, "/status")):
+    bot.handle(text(n, cmd))
+    check("%s explains itself" % cmd,
+          "filed as it arrives" in sent[-1][0], True)
+
+section("a restart changes nothing")
+resumed_id = arrive(photo(110, caption="restart me"))
 bot.persist()
-after = chute.Bot(make_config(root))
-after.handle(text(123, "/undo"))
-check("the new process can still undo it", last.exists(), False)
-after.handle(text(124, "/cancel"))
+resumed = chute.Bot(make_config(root))
+sent.clear()
+check("the new process says nothing on startup", sent, [])
+resumed.handle(tap(111, "b:work", message_id=resumed_id))
+check("and the old message still moves its file",
+      (WORK / "restart me.jpg").exists(), True)
 
-section("/history shows what went where")
-after.handle(text(130, "/history"))
+section("history records filing, moving and deleting")
+resumed.handle(text(120, "/history"))
 hist = sent[-1][0]
 check("newest first header", hist.startswith("<b>Filed</b> (newest first)"),
       True)
-check("shows filed paths", "Work/Attachments" in hist, True)
-check("the undone filing is marked", "</s> undone" in hist, True)
-check("timestamps rendered", bool(_re.search(r"\d{2} \w{3} \d{2}:\d{2}", hist)),
+check("a move is marked with an arrow", "→ <code>Work/Attachments" in hist,
       True)
-check("history survived the restart",
-      len(after.chat_state(CHAT)["history"]) > 3, True)
-
-fresh_chat = chute.Bot(make_config(root))
-fresh_chat.state["chats"] = {}
+check("timestamps rendered", bool(re.search(r"\d{2} \w{3} \d{2}:\d{2}", hist)),
+      True)
+fresh = chute.Bot(make_config(root))
+fresh.state["chats"] = {}
 sent.clear()
-fresh_chat.handle(text(131, "/history"))
-check("empty history says so", sent[-1][0], "Nothing filed yet.")
+fresh.handle(text(121, "/history"))
+check("an empty history says so", sent[-1][0], "Nothing filed yet.")
 
-section("history is bounded")
-cs = after.chat_state(CHAT)
-cs["history"] = [{"at": 1755600000 + i, "path": "P/%d.jpg" % i,
-                  "kind": "Image"} for i in range(300)]
-before_photo = snap(root / "Work/Attachments")
-after.handle(photo(140, caption="cap check"))
-after.handle(tap(141, "b:work"))
-check("trimmed to the keep limit", len(cs["history"]), chute.HISTORY_KEEP)
-check("newest entry is the new filing",
-      cs["history"][-1]["path"].endswith("cap check.jpg"), True)
-after.handle(text(142, "/history"))
-check("only a page is shown plus a count of older",
-      "and %d older" % (chute.HISTORY_KEEP - chute.HISTORY_SHOW)
-      in sent[-1][0], True)
+section("the remembered messages are bounded")
+cs = resumed.chat_state(CHAT)
+cs["filed"] = {str(i): {"path": "p%d" % i, "at": 1} for i in range(5)}
+now = int(chute.time.time())
+for i in range(chute.FILED_KEEP + 5):
+    chute.remember(cs["filed"], 10000 + i,
+                   {"path": "q%d" % i, "at": now + i}, now=now)
+check("capped at the keep limit", len(cs["filed"]), chute.FILED_KEEP)
+check("the stale ones went first", "0" in cs["filed"], False)
 
 shutil.rmtree(root.parent, ignore_errors=True)
 sys.exit(report())

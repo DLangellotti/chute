@@ -20,7 +20,7 @@ class FakeTelegram:
     def call(self, m, **p): return {"username": "bot"}
     def send(self, chat, text, keyboard=None):
         sent.append((chat, text)); return {"message_id": 1}
-    def edit(self, *a, **k): return {}
+    def edit(self, *a, **k): return {"message_id": 1}
     def ack(self, *a, **k): pass
     def download(self, file_id, dest, max_bytes):
         downloads.append(file_id)          # records ANY attempt to pull a file
@@ -51,28 +51,42 @@ for label, update in attacks:
 
 check("bot never downloaded anything for them", downloads, [])
 check("nothing written to the tree", [p.name for p in root.rglob("*") if p.is_file()], [])
+check("the landing folder is still empty",
+      [p.name for p in (root / "Inbox").glob("*")] if (root / "Inbox").is_dir()
+      else [], [])
 check("nothing left staged", list(chute.STAGING.iterdir()), [])
 check("no state created for their chat", str(ATTACKER) in bot.state["chats"], False)
 
-section("stranger tries to hijack the owner's pending item")
+section("a stranger cannot move or delete the owner's file")
 bot.handle(msg(20, OWNER, caption="my photo",
                photo=[{"file_id": "mine", "file_size": 9}]))
-check("owner's item is pending", bot.chat_state(OWNER)["active"] is not None, True)
-hijack = {"update_id": 21, "callback_query": {
-    "id": "c", "from": {"id": ATTACKER}, "data": "b:work",
-    "message": {"message_id": 1, "chat": {"id": OWNER}}}}
-bot.handle(hijack)
-check("stranger cannot press the owner's button",
-      bot.chat_state(OWNER)["stage"], "bucket")
-check("owner's item still pending, unfiled",
-      bot.chat_state(OWNER)["active"] is not None, True)
+landed = root / "Inbox/my photo.jpg"
+check("the owner's file landed", landed.exists(), True)
+owner_msg = [m for m in bot.chat_state(OWNER)["filed"]][-1]
+sent.clear()
+
+
+def stranger(n, data):
+    return {"update_id": n, "callback_query": {
+        "id": "c%d" % n, "from": {"id": ATTACKER}, "data": data,
+        "message": {"message_id": int(owner_msg), "chat": {"id": OWNER}}}}
+
+
+bot.handle(stranger(21, "b:work"))
+check("a move is refused", landed.exists(), True)
+check("and nothing landed in the target folder",
+      (root / "Work/Attachments/my photo.jpg").exists(), False)
+bot.handle(stranger(22, "b:__delete"))
+check("a delete is refused too", landed.exists(), True)
+check("and the stranger is told nothing", sent, [])
 
 section("owner still works")
-bot.handle({"update_id": 22, "callback_query": {
-    "id": "c2", "from": {"id": OWNER}, "data": "b:work",
-    "message": {"message_id": 1, "chat": {"id": OWNER}}}})
-check("owner's tap files it under the caption",
+bot.handle({"update_id": 23, "callback_query": {
+    "id": "c3", "from": {"id": OWNER}, "data": "b:work",
+    "message": {"message_id": int(owner_msg), "chat": {"id": OWNER}}}})
+check("the owner's tap moves it",
       (root / "Work/Attachments/my photo.jpg").exists(), True)
+check("out of the landing folder", landed.exists(), False)
 
 section("replying to strangers is opt-in")
 loud = chute.Bot(make_config(root, security={"reply_to_strangers": True}))

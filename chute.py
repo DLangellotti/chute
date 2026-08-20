@@ -519,11 +519,6 @@ class Telegram:
 
 # ---------------------------------------------------------------- items
 
-def describe_kind(kind):
-    return {"image": "Image", "document": "Document",
-            "media": "Audio/Video", "text": "Note"}.get(kind, "File")
-
-
 def forward_meta(msg):
     meta = {}
     origin = msg.get("forward_origin") or {}
@@ -819,49 +814,56 @@ class Bot:
         self.state.setdefault("chats", {})
 
     def chat_state(self, chat_id):
-        return self.state["chats"].setdefault(str(chat_id), {
-            "queue": [], "active": None, "stage": None, "dest": None,
-            "prompt_id": None, "last_filed": None, "history": []})
+        cs = self.state["chats"].setdefault(str(chat_id), {})
+        cs.setdefault("filed", {})
+        cs.setdefault("history", [])
+        # Shed the queue bookkeeping a pre-0.2 state file carries.
+        for gone in ("queue", "active", "stage", "dest", "prompt_id",
+                     "last_filed"):
+            cs.pop(gone, None)
+        return cs
 
     def persist(self):
         save_json(STATE_PATH, self.state)
 
     # -- keyboards
 
-    def keyboard(self, cs):
+    def keyboard(self, current=None):
+        """Every folder, with the one the file is in right now marked."""
         rows, row = [], []
         for dest in self.cfg.destinations:
-            row.append({"text": dest.label, "callback_data": "b:%s" % dest.key})
+            label = ("• %s" % dest.label) if dest.key == current else dest.label
+            row.append({"text": label, "callback_data": "b:%s" % dest.key})
             if len(row) == 2:
                 rows.append(row)
                 row = []
         if row:
             rows.append(row)
-        rows.append([{"text": "✖️ Discard", "callback_data": "b:__cancel"}])
+        rows.append([{"text": "🗑 Delete", "callback_data": "b:__delete"}])
         return rows
-
-    @staticmethod
-    def undo_keyboard():
-        return [[{"text": "↩️ Undo", "callback_data": "z:last"}]]
 
     def help_text(self):
         lines = ["<b>%s</b> %s" % (APP.title(), VERSION), "",
                  "Send me anything: photos, files, audio, video, links, "
-                 "forwarded messages. Tap a folder button and it is saved "
-                 "there.", "",
+                 "forwarded messages. It is saved the moment it arrives, in "
+                 "<b>%s</b>. Tap a folder on the reply to move it there, tap "
+                 "again to move it somewhere else, 🗑 to delete it."
+                 % self.cfg.inbox.label, "",
                  "<b>Folders</b>"]
         for dest in self.cfg.destinations:
-            lines.append("· %s → <code>%s</code>" % (dest.label, dest.path))
+            mark = "  ← lands here" if dest.key == self.cfg.inbox.key else ""
+            lines.append("· %s → <code>%s</code>%s"
+                         % (dest.label, dest.path, mark))
         lines += ["", "Names are date plus type, like <code>2026-08-20 1848 "
                       "Image.jpg</code>. A caption overrides that: caption a "
                       "photo <code>contract p3</code> and that is its "
                       "filename. Links and text become notes.", "",
+                  "I only answer while my computer is awake. Send anyway: "
+                  "Telegram keeps things for 24 hours and I file them when I "
+                  "wake up.", "",
                   "Limits: 20 MB per file (Telegram's cap), no executable "
                   "file types.", "",
-                  "/undo  take back the last filed item",
                   "/history  what was filed where, and when",
-                  "/status  what's pending",
-                  "/cancel  drop everything pending",
                   "/help  this message"]
         return "\n".join(lines)
 
@@ -875,18 +877,14 @@ class Bot:
                 {"command": "help", "description": "How Chute works"},
                 {"command": "history",
                  "description": "What was filed where, and when"},
-                {"command": "status", "description": "What's pending"},
-                {"command": "undo",
-                 "description": "Take back the last filed item"},
-                {"command": "cancel", "description": "Drop everything pending"},
             ])
             self.tg.call(
                 "setMyDescription",
                 description="Send anything: photos, files, audio, video, "
-                            "links. Tap a folder button and it lands in that "
-                            "folder on the owner's computer, named by date "
-                            "and type, or by your caption. Owner's account "
-                            "only.")
+                            "links. It is saved to the owner's computer as it "
+                            "arrives; tap a folder on the reply to move it "
+                            "there. Answers only while that computer is awake, "
+                            "and only to its owner.")
             self.tg.call(
                 "setMyShortDescription",
                 short_description="Files what you send into folders on your "
@@ -900,7 +898,6 @@ class Bot:
         log("%s %s connected as @%s, filing into %s"
             % (APP, VERSION, me.get("username"), self.cfg.root))
         self.register_ui()
-        self.recover()
         backoff = 1
         while True:
             try:
@@ -926,17 +923,6 @@ class Bot:
                 except Exception as exc:                  # never kill the loop
                     log("handler error: %r" % (exc,))
                 self.persist()
-
-    def recover(self):
-        """After a restart, re-prompt for anything caught mid-flow."""
-        for chat_id, cs in self.state["chats"].items():
-            if cs.get("active"):
-                cs.update({"stage": "bucket", "dest": None})
-                try:
-                    self.prompt(int(chat_id), cs, "Picking up where we left off.\n")
-                except Exception as exc:
-                    log("recover failed for %s: %r" % (chat_id, exc))
-        self.persist()
 
     def handle(self, update):
         if "callback_query" in update:
@@ -976,26 +962,49 @@ class Bot:
             return self.tg.send(chat_id, "Could not download that: %s" % exc)
         if not item:
             return self.tg.send(chat_id, "Nothing to file in that message.")
+        self.land(chat_id, cs, item)
 
-        cs["queue"].append(item)
-        self.advance(chat_id, cs)
+    def land(self, chat_id, cs, item):
+        """Write an arriving item into the landing folder and offer to move it."""
+        inbox = self.cfg.inbox
+        try:
+            directory = self.cfg.resolve_dir(inbox, item["kind"],
+                                             item.get("ext", ""))
+            path = file_item(item, directory, name_for(item, self.cfg.naming),
+                             self.cfg)
+        except Exception as exc:
+            log("filing failed: %r" % (exc,))
+            discard(item)
+            return self.tg.send(chat_id, "Could not save that: %s" % exc)
+
+        record = restat({"stem": path.stem, "ext": path.suffix,
+                         "kind": item["kind"]}, path, inbox.key)
+        self.note_history(cs, path, item["kind"], "filed")
+        log("filed -> %s" % rel_to(self.cfg.root, path))
+        sent = self.tg.send(chat_id, self.filed_text(record),
+                            self.keyboard(inbox.key))
+        remember(cs["filed"], sent.get("message_id"), record)
+
+    def filed_text(self, record, verb="Filed"):
+        rel = rel_to(self.cfg.root, record["path"])
+        return "%s\n<code>%s</code>" % (verb, rel)
+
+    def note_history(self, cs, path, kind, action):
+        history = cs.setdefault("history", [])
+        history.append({"at": int(time.time()),
+                        "path": rel_to(self.cfg.root, path),
+                        "kind": kind_word({"kind": kind}), "action": action})
+        del history[:-HISTORY_KEEP]
 
     def on_command(self, chat_id, cs, text):
         cmd = text.split()[0].lower().lstrip("/").split("@")[0]
         if cmd in ("start", "help"):
             return self.tg.send(chat_id, self.help_text())
-        if cmd == "status":
-            lines = ["Root: <code>%s</code>" % self.cfg.root]
-            active = cs.get("active")
-            if active:
-                lines.append("In progress: %s, waiting on %s"
-                             % (describe_kind(active["kind"]), cs.get("stage")))
-            else:
-                lines.append("Nothing in progress.")
-            lines.append("Queued: %d" % len(cs["queue"]))
-            return self.tg.send(chat_id, "\n".join(lines))
-        if cmd == "undo":
-            return self.undo_last(chat_id, cs)
+        if cmd in ("undo", "cancel", "back", "status"):
+            return self.tg.send(
+                chat_id, "Nothing waits for an answer any more: what you send "
+                         "is filed as it arrives. Tap a folder on its message "
+                         "to move it, or 🗑 to delete it.")
         if cmd == "history":
             history = cs.get("history") or []
             if not history:
@@ -1004,61 +1013,17 @@ class Bot:
             for entry in reversed(history[-HISTORY_SHOW:]):
                 stamp = datetime.fromtimestamp(entry["at"]).strftime(
                     "%d %b %H:%M")
-                line = "%s  <code>%s</code>" % (stamp, entry["path"])
-                if entry.get("undone"):
-                    line = "<s>%s</s> undone" % line
-                lines.append(line)
+                mark = {"moved": "→", "deleted": "🗑"}.get(
+                    entry.get("action"), " ")
+                lines.append("%s %s <code>%s</code>"
+                             % (stamp, mark, entry["path"]))
             older = len(history) - len(history[-HISTORY_SHOW:])
             if older > 0:
                 lines.append("<i>and %d older</i>" % older)
             return self.tg.send(chat_id, "\n".join(lines))
-        if cmd == "cancel":
-            dropped = 0
-            if cs.get("active"):
-                discard(cs["active"])
-                dropped += 1
-            for queued in cs["queue"]:
-                discard(queued)
-                dropped += 1
-            cs.update({"queue": [], "active": None, "stage": None, "dest": None,
-                       "prompt_id": None})
-            return self.tg.send(chat_id, "Cleared %d item(s)." % dropped)
         return self.tg.send(chat_id, "Unknown command. Try /help.")
 
     # -- flow
-
-    def advance(self, chat_id, cs):
-        if cs.get("active"):
-            return self.refresh_prompt(chat_id, cs)
-        if not cs["queue"]:
-            return
-        cs["active"] = cs["queue"].pop(0)
-        cs.update({"stage": "bucket", "dest": None})
-        self.prompt(chat_id, cs)
-
-    def prompt_text(self, cs, prefix=""):
-        item = cs["active"]
-        bits = [describe_kind(item["kind"])]
-        if item.get("orig_name"):
-            bits.append("<code>%s</code>" % item["orig_name"])
-        if item.get("size"):
-            bits.append("%.0f KB" % (item["size"] / 1024.0))
-        if item.get("caption"):
-            bits.append("“%s”" % item["caption"][:60])
-        head = "%s%s" % (prefix, " · ".join(bits))
-        if cs["queue"]:
-            head += "\n<i>%d more waiting</i>" % len(cs["queue"])
-        return head + "\n\nWhere does this go?"
-
-    def prompt(self, chat_id, cs, prefix=""):
-        sent = self.tg.send(chat_id, self.prompt_text(cs, prefix), self.keyboard(cs))
-        cs["prompt_id"] = sent.get("message_id")
-
-    def refresh_prompt(self, chat_id, cs):
-        """Keep the live prompt's waiting count honest as an album piles up."""
-        if cs.get("stage") != "bucket" or not cs.get("prompt_id"):
-            return
-        self.tg.edit(chat_id, cs["prompt_id"], self.prompt_text(cs), self.keyboard(cs))
 
     def on_callback(self, cq):
         msg = cq.get("message") or {}
@@ -1072,128 +1037,76 @@ class Bot:
                                else None)
         cs = self.chat_state(chat_id)
         self.tg.ack(cq["id"])
-        prefix, _, value = (cq.get("data") or "").partition(":")
+        message_id = msg.get("message_id")
+        record = (cs.get("filed") or {}).get(str(message_id))
+        _, _, value = (cq.get("data") or "").partition(":")
 
-        # Undo runs after filing, when nothing is pending, so it comes first.
-        if prefix == "z":
-            return self.undo_last(chat_id, cs, via_edit=msg["message_id"])
+        if record is None:
+            return self.confirm(
+                chat_id, cs, message_id, None,
+                "I no longer have a record of that file, so I have not touched "
+                "anything. Move it by hand.")
+        if value == "__delete":
+            return self.remove(chat_id, cs, message_id, record)
+        if value in self.cfg.by_key:
+            return self.move(chat_id, cs, message_id, record, value)
+        # Anything else is a button from a config that has since changed.
 
-        if not cs.get("active"):
-            return self.tg.edit(chat_id, msg["message_id"],
-                                "That item is no longer pending.")
-
-        if value == "__cancel":
-            discard(cs["active"])
-            cs.update({"active": None, "stage": None})
-            self.tg.edit(chat_id, msg["message_id"], "Discarded.")
-            return self.advance(chat_id, cs)
-
-        if value not in self.cfg.by_key:
-            return
-        cs["dest"] = value
-        return self.finish(chat_id, cs, via_edit=msg["message_id"])
-
-    def finish(self, chat_id, cs, via_edit=None):
-        item = cs.get("active")
-        if not item:
-            return
-        name = name_for(item, self.cfg.naming)
+    def move(self, chat_id, cs, message_id, record, dest_key):
+        dest = self.cfg.by_key[dest_key]
         try:
-            directory = self.cfg.resolve_dir(
-                self.cfg.by_key[cs["dest"]], item["kind"], item.get("ext", ""))
-            dest = file_item(item, directory, name, self.cfg)
+            directory = self.cfg.resolve_dir(dest, record["kind"],
+                                             record.get("ext", ""))
+            path = move_filed(record, directory, self.cfg.root)
+        except NotAsFiled as exc:
+            cs["filed"].pop(str(message_id), None)
+            return self.confirm(chat_id, cs, message_id, None, str(exc))
         except Exception as exc:
-            log("filing failed: %r" % (exc,))
-            return self.tg.send(chat_id, "Could not save that: %s" % exc)
+            log("move failed: %r" % (exc,))
+            return self.tg.send(chat_id, "Could not move that: %s" % exc)
 
+        went_somewhere = str(path) != record["path"]
+        restat(record, path, dest_key)
+        if went_somewhere:
+            self.note_history(cs, path, record["kind"], "moved")
+            log("moved -> %s" % rel_to(self.cfg.root, path))
+        self.confirm(chat_id, cs, message_id, record,
+                     self.filed_text(record,
+                                     "Moved" if went_somewhere else "Filed"))
+
+    def remove(self, chat_id, cs, message_id, record):
         try:
-            rel = dest.relative_to(self.cfg.root)
-        except ValueError:
-            rel = dest
-        log("filed -> %s" % rel)
-        history = cs.setdefault("history", [])
-        history.append({"at": int(time.time()), "path": str(rel),
-                        "kind": kind_word(item)})
-        del history[:-HISTORY_KEEP]
-        # Remember enough to put it back, and the size and mtime it had when we
-        # wrote it, so undo never touches a file that has since been edited.
-        cs["last_filed"] = None
-        try:
-            st = dest.stat()
-            record = {k: item.get(k) for k in
-                      ("id", "kind", "ext", "orig_name", "caption", "text",
-                       "meta", "media_group_id", "size")}
-            record.update({"path": str(dest), "written": st.st_size,
-                           "mtime": int(st.st_mtime)})
-            cs["last_filed"] = record
-        except OSError:
-            pass
-        confirmation = "✅ <code>%s</code>" % rel
-        keyboard = self.undo_keyboard() if cs.get("last_filed") else None
-        if via_edit:
-            self.tg.edit(chat_id, via_edit, confirmation, keyboard)
-        else:
-            self.tg.send(chat_id, confirmation, keyboard)
+            path = delete_filed(record, self.cfg.root)
+        except NotAsFiled as exc:
+            cs["filed"].pop(str(message_id), None)
+            return self.confirm(chat_id, cs, message_id, None, str(exc))
+        except Exception as exc:
+            log("delete failed: %r" % (exc,))
+            return self.tg.send(chat_id, "Could not delete that: %s" % exc)
+        self.note_history(cs, path, record["kind"], "deleted")
+        log("deleted -> %s" % rel_to(self.cfg.root, path))
+        cs["filed"].pop(str(message_id), None)
+        self.confirm(chat_id, cs, message_id, None,
+                     "🗑 Deleted <code>%s</code>"
+                     % rel_to(self.cfg.root, path))
 
-        cs.update({"active": None, "stage": None, "dest": None,
-                   "prompt_id": None})
-        self.advance(chat_id, cs)
+    def confirm(self, chat_id, cs, message_id, record, text):
+        """Update a message in place, or post a fresh one if it is too old.
 
-    def undo_last(self, chat_id, cs, via_edit=None):
-        """Put the last filed item back in the queue, if it is untouched."""
-        def say(text):
-            if via_edit:
-                return self.tg.edit(chat_id, via_edit, text)
-            return self.tg.send(chat_id, text)
-
-        rec = cs.get("last_filed")
-        if not rec:
-            return say("Nothing to undo. Only the last filed item can come "
-                       "back, and only until the next one.")
-        path = Path(rec["path"])
-        try:
-            st = path.stat()
-        except OSError:
-            cs["last_filed"] = None
-            return say("<code>%s</code> is not where I left it, so I have not "
-                       "touched anything." % rec["path"])
-        if st.st_size != rec.get("written") or int(st.st_mtime) != rec.get("mtime"):
-            cs["last_filed"] = None
-            return say("<code>%s</code> has changed since I filed it, so I have "
-                       "left it alone." % rec["path"])
-
-        item = {k: v for k, v in rec.items()
-                if k not in ("path", "written", "mtime")}
-        if item.get("kind") == "text":
-            # A note was written from the text we still hold, so removing the
-            # file loses nothing: the item goes back in the queue intact.
-            try:
-                path.unlink()
-            except OSError as exc:
-                return say("Could not take that back: %s" % exc)
-        else:
-            try:
-                STAGING.mkdir(parents=True, exist_ok=True)
-                staged = unique_path(STAGING, str(item.get("id") or "undo"),
-                                     item.get("ext") or "")
-                shutil.move(str(path), str(staged))
-            except OSError as exc:
-                return say("Could not take that back: %s" % exc)
-            item["staged"] = str(staged)
-
-        cs["last_filed"] = None
-        cs["queue"].insert(0, item)
-        try:
-            rel = path.relative_to(self.cfg.root)
-        except ValueError:
-            rel = path
-        for entry in reversed(cs.get("history") or []):
-            if entry.get("path") == str(rel) and not entry.get("undone"):
-                entry["undone"] = True
-                break
-        log("undone <- %s" % rel)
-        say("↩️ Took <code>%s</code> back." % rel)
-        self.advance(chat_id, cs)
+        Telegram refuses edits to messages older than 48 hours, but the buttons
+        on such a message still fire. Without this fallback the file would move
+        and the user would see nothing happen at all.
+        """
+        keyboard = self.keyboard(record["dest"]) if record else None
+        if message_id and self.tg.edit(chat_id, message_id, text, keyboard):
+            return message_id
+        sent = self.tg.send(chat_id, text, keyboard)
+        new_id = sent.get("message_id")
+        if record is not None and new_id:
+            # The new message is the live handle now; the old one is dead.
+            cs["filed"].pop(str(message_id), None)
+            remember(cs["filed"], new_id, record)
+        return new_id
 
 
 # ---------------------------------------------------------------- single instance
