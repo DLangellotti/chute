@@ -209,13 +209,9 @@ def keys_of(keyboard):
     return [b["callback_data"] for row in keyboard or [] for b in row]
 
 
-section("/back explains the instant flow")
 # The restart section left this instance holding an item its twin already
 # filed, so clear it before driving the flow again.
 bot.handle(text(79, "/cancel"))
-bot.handle(text(80, "/back"))
-check("/back points at undo", "/undo takes the last one back" in sent[-1][0],
-      True)
 
 section("undo a filing")
 sent.clear(); edits.clear(); edit_kb.clear()

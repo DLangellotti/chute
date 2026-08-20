@@ -3,9 +3,21 @@
   "allowed_user_ids": [],
   "root": "~/Downloads",
   "destinations": [
-    { "label": "🧾 Receipts", "path": "Receipts" },
-    { "label": "📄 Docs", "path": "Documents" },
-    { "label": "📸 Photos", "path": "Photos" }
+    {
+      "label": "🧾 Receipts",
+      "path": "Receipts"
+    },
+    {
+      "label": "📄 Docs",
+      "path": "Documents"
+    },
+    {
+      "label": "📸 Photos",
+      "path": "Photos"
+    }
   ],
-  "naming": { "style": "kebab", "lowercase": true, "date_prefix": true }
+  "naming": {
+    "style": "kebab",
+    "lowercase": true
+  }
 }

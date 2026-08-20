@@ -268,7 +268,6 @@ class Destination:
 class Config:
     def __init__(self, data, source=None):
         self.source = source
-        self.raw = data
         self.token = str(data.get("bot_token") or "").strip()
         if not self.token:
             raise ConfigError("bot_token is empty. Run: chute setup")
@@ -506,8 +505,9 @@ def forward_meta(msg):
 def extract_item(msg, tg, staging, cfg):
     """Turn an incoming message into a filing item, downloading any file."""
     caption = (msg.get("caption") or "").strip()
-    item = {"id": "%s-%s" % (msg.get("message_id"), int(time.time() * 1000) % 100000),
-            "caption": caption, "media_group_id": msg.get("media_group_id")}
+    item = {"id": "%s-%s" % (msg.get("message_id"),
+                             int(time.time() * 1000) % 100000),
+            "caption": caption}
 
     file_id = orig_name = None
     default_ext = ""
@@ -870,9 +870,6 @@ class Bot:
             if older > 0:
                 lines.append("<i>and %d older</i>" % older)
             return self.tg.send(chat_id, "\n".join(lines))
-        if cmd == "back":
-            return self.tg.send(chat_id, "Filing happens as soon as you tap a "
-                                         "folder. /undo takes the last one back.")
         if cmd == "cancel":
             dropped = 0
             if cs.get("active"):
