@@ -149,14 +149,51 @@ d3 = chute.file_item({"kind": "document", "staged": staged("c.pdf"), "ext": ".pd
 check("no doubled extension", d3.name, "Contract.pdf")
 check("missing folder created", d3.parent.is_dir(), True)
 
-section("date prefix applies exactly once")
-dcfg = make_config(root, naming={"date_prefix": True})
-item = {"kind": "image", "caption": "Receipt", "ext": ".jpg"}
-name = chute.suggested_name(item, dcfg.naming)
-item["staged"] = staged("d.jpg")
-out = chute.file_item(item, root / "Dated", name, dcfg)
-today = chute.datetime.now().strftime("%Y-%m-%d")
-check("prefixed once, not twice", out.name, "%s Receipt.jpg" % today)
+section("auto names: date, time, type word")
+stamp = chute.datetime(2026, 8, 20, 18, 48)
+check("image", chute.auto_name({"kind": "image"}, now=stamp),
+      "2026-08-20 1848 Image")
+check("document", chute.auto_name({"kind": "document", "ext": ".pdf"},
+                                  now=stamp), "2026-08-20 1848 Document")
+check("voice note is audio", chute.auto_name(
+    {"kind": "media", "ext": ".ogg"}, now=stamp), "2026-08-20 1848 Audio")
+check("mp3 is audio", chute.kind_word({"kind": "media", "ext": ".mp3"}),
+      "Audio")
+check("mp4 is video", chute.kind_word({"kind": "media", "ext": ".mp4"}),
+      "Video")
+check("text is a note", chute.kind_word({"kind": "text"}), "Note")
+check("caption changes nothing", chute.auto_name(
+    {"kind": "image", "caption": "ignored"}, now=stamp),
+    "2026-08-20 1848 Image")
+check("original filename changes nothing", chute.auto_name(
+    {"kind": "document", "orig_name": "Q3 deck.pdf"}, now=stamp),
+    "2026-08-20 1848 Document")
+
+section("a caption overrides the auto name")
+check("caption wins", chute.name_for({"kind": "image", "caption": "Router "
+      "diagram"}), "Router diagram")
+check("caption is cleaned", chute.name_for(
+    {"kind": "image", "caption": "a/b: c"}), "ab c")
+check("first line only", chute.name_for(
+    {"kind": "image", "caption": "Title\nsecond line"}), "Title")
+check("no caption means auto name", chute.name_for(
+    {"kind": "image"}, ).endswith(" Image"), True)
+check("junk caption falls back to auto, type word kept", chute.name_for(
+    {"kind": "media", "ext": ".ogg", "caption": "///..."}).endswith(" Audio"),
+    True)
+check("whitespace caption falls back too", chute.name_for(
+    {"kind": "document", "caption": "   "}).endswith(" Document"), True)
+
+section("same-minute files get suffixes, not overwrites")
+cfg2 = make_config(root)
+first = chute.file_item({"kind": "image", "staged": staged("m1.jpg"),
+                         "ext": ".jpg"}, root / "Minute",
+                        chute.auto_name({"kind": "image"}, now=stamp), cfg2)
+second = chute.file_item({"kind": "image", "staged": staged("m2.jpg"),
+                          "ext": ".jpg"}, root / "Minute",
+                         chute.auto_name({"kind": "image"}, now=stamp), cfg2)
+check("first keeps the plain name", first.name, "2026-08-20 1848 Image.jpg")
+check("second gets a suffix", second.name, "2026-08-20 1848 Image 2.jpg")
 
 section("text capture")
 note = chute.file_item(
@@ -175,15 +212,7 @@ nofm = chute.file_item({"kind": "text", "text": "no fm"}, root / "Plain", "n2",
                        make_config(root, text_capture={"frontmatter": False}))
 check("frontmatter can be off", nofm.read_text().startswith("---"), False)
 
-section("suggested names")
-check("caption wins", chute.suggested_name({"kind": "image", "caption": "A B"}), "A B")
-check("filename stem used", chute.suggested_name(
-    {"kind": "document", "orig_name": "Q3 deck.pdf"}), "Q3 deck")
-check("url becomes host plus slug", chute.suggested_name(
-    {"kind": "text", "text": "https://example.com/blog/some-article"}),
-    "example.com some article")
-check("text beats url", chute.suggested_name(
-    {"kind": "text", "text": "Worth reading\nhttps://x.com/a"}), "Worth reading")
+
 
 section("single instance lock")
 import os

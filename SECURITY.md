@@ -22,9 +22,8 @@ with `state.json`, the staging folder and the log.
 
 ## What is enforced
 
-**Paths cannot escape the root.** Every destination path from the config, and
-every folder path typed into `📂 Other folder`, is resolved and checked for
-containment before anything is written. Symlinks are resolved first, so a symlink
+**Paths cannot escape the root.** Every destination path from the config is
+resolved and checked for containment before anything is written. Symlinks are resolved first, so a symlink
 inside the root cannot be used to step outside it. `chute check` runs the same
 validation, so a bad config is caught before the bot starts.
 
@@ -76,9 +75,9 @@ Telegram is not end-to-end encrypted for bot chats. Everything you send passes
 through Telegram's servers in a form they can read. Do not use Chute to move
 material where that matters.
 
-`📂 Other folder` lets an authorised user write anywhere under the root. Set
-`"security": {"allow_custom_paths": false}` to remove the button and restrict
-writes to the configured destinations.
+Writes only ever go to the folders named in the config. There is no way to
+type a path from Telegram, so a compromised account can misfile within your
+configured folders but cannot reach outside them.
 
 ## Reporting
 

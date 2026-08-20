@@ -3,9 +3,10 @@
 Chute - send a file to a Telegram bot, it lands in the right folder.
 
 Point it at any folder tree: an Obsidian vault, a Logseq graph, a NAS share, a
-plain Downloads folder. Send the bot an image, a PDF, a voice note or a link.
-It asks which folder the item belongs to, asks for a name, and writes it to
-disk. Polling only, so it works behind NAT with no public URL.
+plain Downloads folder. Send the bot anything Telegram carries: photos, any
+file, audio, video, links, forwarded text. Tap a folder button and it is
+written to that folder, named by date and type, or by your caption. Polling
+only, so it works behind NAT with no public URL.
 
     chute.py setup     one-time: bot token, root folder, destinations
     chute.py run       long-poll Telegram and file what arrives
@@ -40,6 +41,8 @@ STATE_PATH = HERE / "state.json"
 
 API_ROOT = "https://api.telegram.org"
 POLL_TIMEOUT = 50                     # seconds Telegram holds getUpdates open
+HISTORY_KEEP = 200                    # filings remembered per chat for /history
+HISTORY_SHOW = 15                     # lines /history prints at once
 TG_DOWNLOAD_CEILING = 20 * 1024 * 1024   # Bot API hard limit, not ours to raise
 
 KINDS = ("image", "document", "media", "text")
@@ -99,6 +102,24 @@ def save_json(path, data):
 
 class ConfigError(Exception):
     """Raised for anything wrong in config.json, with a message worth reading."""
+
+
+# What a BotFather token looks like: digits, a colon, then a long code.
+TOKEN_RE = re.compile(r"^\d{5,12}:[A-Za-z0-9_-]{25,}$")
+
+
+def clean_token(raw):
+    """Strip the quotes and stray spaces a pasted token often arrives with."""
+    return (raw or "").strip().strip("'\"").strip()
+
+
+def cli_name():
+    """How to invoke the chute command from where this user sits.
+
+    Every printed follow-up must be typeable as-is: 'chute install' is wrong
+    advice for someone who has not linked chute onto their PATH.
+    """
+    return "chute" if shutil.which("chute") else "./chute"
 
 
 # ---------------------------------------------------------------- paths
@@ -286,7 +307,6 @@ class Config:
             for e in sec.get("blocked_extensions", DEFAULT_BLOCKED_EXT))
         self.max_bytes = min(
             int(sec.get("max_file_mb", 20)) * 1024 * 1024, TG_DOWNLOAD_CEILING)
-        self.allow_custom = bool(sec.get("allow_custom_paths", True))
         # Silent by default. Replying confirms the bot is live to anyone who
         # finds it, and lets a stranger burn the bot's rate limit with noise.
         self.reply_to_strangers = bool(sec.get("reply_to_strangers", False))
@@ -401,9 +421,7 @@ class Telegram:
             if exc.code == 409:
                 raise TelegramConflict(detail.get("description") or "conflict")
             if exc.code == 401:
-                raise ConfigError(
-                    "Telegram rejected the bot token. Check config.json, or "
-                    "create a new bot with @BotFather.")
+                raise ConfigError("Telegram rejected the bot token.")
             raise RuntimeError("%s failed: HTTP %s %s"
                                % (method, exc.code, detail.get("description", "")))
         except (urllib.error.URLError, OSError) as exc:
@@ -531,7 +549,7 @@ def extract_item(msg, tg, staging, cfg):
 
     ext = ext_of(orig_name, default_ext)
     if ext in cfg.blocked_ext:
-        raise ValueError("%s files are blocked by config" % ext)
+        raise ValueError("%s files are blocked for safety" % ext)
 
     staging.mkdir(parents=True, exist_ok=True)
     staged = staging / ("%s%s" % (item["id"], ext))
@@ -543,32 +561,55 @@ def extract_item(msg, tg, staging, cfg):
         staged = renamed
     if ext in cfg.blocked_ext:
         staged.unlink(missing_ok=True)
-        raise ValueError("%s files are blocked by config" % ext)
+        raise ValueError("%s files are blocked for safety" % ext)
 
     item.update({"staged": str(staged), "ext": ext, "orig_name": orig_name,
                  "size": staged.stat().st_size})
     return item
 
 
-def suggested_name(item, naming=None):
-    """Best guess at a filename, offered to the user behind the '-' shortcut."""
-    naming = naming or {}
-    if item.get("caption"):
-        return clean_name(item["caption"].splitlines()[0], naming)
-    if item.get("kind") == "text":
-        text = (item.get("text") or "").strip()
-        urls = re.findall(r"https?://\S+", text)
-        stripped = re.sub(r"https?://\S+", "", text).strip()
-        if stripped:
-            return clean_name(stripped.splitlines()[0], naming)
-        if urls:
-            parsed = urllib.parse.urlparse(urls[0])
-            host = parsed.netloc.replace("www.", "")
-            slug = re.sub(r"[-_]+", " ", parsed.path.strip("/").split("/")[-1]).strip()
-            return clean_name(("%s %s" % (host, slug)).strip(), naming)
-    if item.get("orig_name"):
-        return clean_name(Path(item["orig_name"]).stem, naming)
-    return clean_name("", naming)
+AUDIO_EXT = {".ogg", ".oga", ".opus", ".mp3", ".m4a", ".aac", ".wav",
+             ".flac", ".wma"}
+
+
+def kind_word(item):
+    """The conventional word for what this is: Image, Document, Audio..."""
+    kind = item.get("kind")
+    if kind == "image":
+        return "Image"
+    if kind == "document":
+        return "Document"
+    if kind == "text":
+        return "Note"
+    if kind == "media":
+        ext = (item.get("ext") or "").lower()
+        return "Audio" if ext in AUDIO_EXT else "Video"
+    return "File"
+
+
+def auto_name(item, now=None):
+    """Every file is named the same way: date, time, and what it is.
+
+    No naming step in the chat; a second file in the same minute gets a
+    numeric suffix from unique_path.
+    """
+    now = now or datetime.now()
+    return "%s %s" % (now.strftime("%Y-%m-%d %H%M"), kind_word(item))
+
+
+def name_for(item, naming=None):
+    """The filename: the sender's caption if there is one, else the auto name.
+
+    A caption is the one deliberate act of naming left in the flow, so it
+    wins. A caption that cleans away to nothing falls back to the auto name
+    rather than to a bare date stamp with no type word.
+    """
+    first_line = (item.get("caption") or "").strip().splitlines()
+    if first_line:
+        candidate = BIDI.sub("", first_line[0])
+        if ILLEGAL.sub("", candidate).strip().strip(". "):
+            return clean_name(first_line[0], naming)
+    return auto_name(item)
 
 
 # ---------------------------------------------------------------- writing
@@ -602,10 +643,6 @@ def note_body(item, title, opts):
 def file_item(item, directory, name, cfg):
     directory.mkdir(parents=True, exist_ok=True)
     stem = clean_name(name, cfg.naming)
-    # Applied here and nowhere else, so a name that round-trips through the
-    # suggestion prompt does not collect a second date.
-    if cfg.naming.get("date_prefix"):
-        stem = "%s %s" % (datetime.now().strftime("%Y-%m-%d"), stem)
     if item["kind"] == "text":
         opts = cfg.text_capture
         ext = ".txt" if opts.get("format") == "txt" else ".md"
@@ -642,8 +679,7 @@ class Bot:
     def chat_state(self, chat_id):
         return self.state["chats"].setdefault(str(chat_id), {
             "queue": [], "active": None, "stage": None, "dest": None,
-            "prompt_id": None, "last_dest": None, "custom_dir": None,
-            "last_filed": None})
+            "prompt_id": None, "last_filed": None, "history": []})
 
     def persist(self):
         save_json(STATE_PATH, self.state)
@@ -659,23 +695,8 @@ class Bot:
                 row = []
         if row:
             rows.append(row)
-        tail = []
-        last = cs.get("last_dest")
-        if last in self.cfg.by_key:
-            tail.append({"text": "🔁 %s, auto-name" % self.cfg.by_key[last].label,
-                         "callback_data": "q:%s" % last})
-        if self.cfg.allow_custom:
-            tail.append({"text": "📂 Other folder", "callback_data": "b:__custom"})
-        if tail:
-            rows.append(tail)
         rows.append([{"text": "✖️ Discard", "callback_data": "b:__cancel"}])
         return rows
-
-    @staticmethod
-    def back_keyboard():
-        """Shown once a folder is picked, so a wrong tap costs one more tap."""
-        return [[{"text": "⬅️ Back", "callback_data": "b:__back"},
-                 {"text": "✖️ Discard", "callback_data": "b:__cancel"}]]
 
     @staticmethod
     def undo_keyboard():
@@ -683,30 +704,60 @@ class Bot:
 
     def help_text(self):
         lines = ["<b>%s</b> %s" % (APP.title(), VERSION), "",
-                 "Send an image, a PDF, a voice note or a link and I'll ask "
-                 "where it goes, then write it into your folder tree.", "",
+                 "Send me anything: photos, files, audio, video, links, "
+                 "forwarded messages. Tap a folder button and it is saved "
+                 "there.", "",
                  "<b>Folders</b>"]
         for dest in self.cfg.destinations:
             lines.append("· %s → <code>%s</code>" % (dest.label, dest.path))
-        lines += ["", "A caption becomes the suggested filename, so you can send "
-                      "the picture with its name attached and just tap a folder, "
-                      "then send <code>-</code>.", "",
-                  "Tapped the wrong folder? Use ⬅️ Back, or /back. Filed "
-                  "something by mistake? ↩️ Undo on the confirmation, or "
-                  "/undo, puts it back in the queue.", "",
-                  "/status  what's pending", "/back  return to the folder list",
+        lines += ["", "Names are date plus type, like <code>2026-08-20 1848 "
+                      "Image.jpg</code>. A caption overrides that: caption a "
+                      "photo <code>contract p3</code> and that is its "
+                      "filename. Links and text become notes.", "",
+                  "Limits: 20 MB per file (Telegram's cap), no executable "
+                  "file types.", "",
                   "/undo  take back the last filed item",
+                  "/history  what was filed where, and when",
+                  "/status  what's pending",
                   "/cancel  drop everything pending",
                   "/help  this message"]
         return "\n".join(lines)
 
     # -- loop
 
+    def register_ui(self):
+        """Telegram's built-in instruction surfaces: the / command menu and
+        the description shown before a chat starts. Best effort."""
+        try:
+            self.tg.call("setMyCommands", commands=[
+                {"command": "help", "description": "How Chute works"},
+                {"command": "history",
+                 "description": "What was filed where, and when"},
+                {"command": "status", "description": "What's pending"},
+                {"command": "undo",
+                 "description": "Take back the last filed item"},
+                {"command": "cancel", "description": "Drop everything pending"},
+            ])
+            self.tg.call(
+                "setMyDescription",
+                description="Send anything: photos, files, audio, video, "
+                            "links. Tap a folder button and it lands in that "
+                            "folder on the owner's computer, named by date "
+                            "and type, or by your caption. Owner's account "
+                            "only.")
+            self.tg.call(
+                "setMyShortDescription",
+                short_description="Files what you send into folders on your "
+                                  "own computer.")
+        except Exception as exc:
+            log("could not register the command menu: %s" % exc)
+
     def run(self):
         STAGING.mkdir(parents=True, exist_ok=True)
         me = self.tg.call("getMe")
         log("%s %s connected as @%s, filing into %s"
             % (APP, VERSION, me.get("username"), self.cfg.root))
+        self.register_ui()
         self.recover()
         backoff = 1
         while True:
@@ -738,7 +789,7 @@ class Bot:
         """After a restart, re-prompt for anything caught mid-flow."""
         for chat_id, cs in self.state["chats"].items():
             if cs.get("active"):
-                cs.update({"stage": "bucket", "dest": None, "custom_dir": None})
+                cs.update({"stage": "bucket", "dest": None})
                 try:
                     self.prompt(int(chat_id), cs, "Picking up where we left off.\n")
                 except Exception as exc:
@@ -774,11 +825,6 @@ class Bot:
 
         if text.startswith("/"):
             return self.on_command(chat_id, cs, text)
-        if cs["stage"] == "name" and text:
-            return self.finish(chat_id, cs, text)
-        if cs["stage"] == "custom" and text:
-            return self.on_custom_path(chat_id, cs, text)
-
         try:
             item = extract_item(msg, self.tg, STAGING, self.cfg)
         except ValueError as exc:
@@ -805,17 +851,28 @@ class Bot:
             else:
                 lines.append("Nothing in progress.")
             lines.append("Queued: %d" % len(cs["queue"]))
-            if cs.get("last_dest") in self.cfg.by_key:
-                lines.append("Last folder: %s" % self.cfg.by_key[cs["last_dest"]].label)
             return self.tg.send(chat_id, "\n".join(lines))
         if cmd == "undo":
             return self.undo_last(chat_id, cs)
+        if cmd == "history":
+            history = cs.get("history") or []
+            if not history:
+                return self.tg.send(chat_id, "Nothing filed yet.")
+            lines = ["<b>Filed</b> (newest first)"]
+            for entry in reversed(history[-HISTORY_SHOW:]):
+                stamp = datetime.fromtimestamp(entry["at"]).strftime(
+                    "%d %b %H:%M")
+                line = "%s  <code>%s</code>" % (stamp, entry["path"])
+                if entry.get("undone"):
+                    line = "<s>%s</s> undone" % line
+                lines.append(line)
+            older = len(history) - len(history[-HISTORY_SHOW:])
+            if older > 0:
+                lines.append("<i>and %d older</i>" % older)
+            return self.tg.send(chat_id, "\n".join(lines))
         if cmd == "back":
-            if cs.get("active") and cs.get("stage") in ("name", "custom"):
-                cs.update({"stage": "bucket", "dest": None, "custom_dir": None})
-                return self.prompt(chat_id, cs)
-            return self.tg.send(chat_id, "Nothing to go back to. /undo puts the "
-                                         "last filed item back.")
+            return self.tg.send(chat_id, "Filing happens as soon as you tap a "
+                                         "folder. /undo takes the last one back.")
         if cmd == "cancel":
             dropped = 0
             if cs.get("active"):
@@ -825,7 +882,7 @@ class Bot:
                 discard(queued)
                 dropped += 1
             cs.update({"queue": [], "active": None, "stage": None, "dest": None,
-                       "prompt_id": None, "custom_dir": None})
+                       "prompt_id": None})
             return self.tg.send(chat_id, "Cleared %d item(s)." % dropped)
         return self.tg.send(chat_id, "Unknown command. Try /help.")
 
@@ -837,7 +894,7 @@ class Bot:
         if not cs["queue"]:
             return
         cs["active"] = cs["queue"].pop(0)
-        cs.update({"stage": "bucket", "dest": None, "custom_dir": None})
+        cs.update({"stage": "bucket", "dest": None})
         self.prompt(chat_id, cs)
 
     def prompt_text(self, cs, prefix=""):
@@ -892,65 +949,19 @@ class Bot:
             self.tg.edit(chat_id, msg["message_id"], "Discarded.")
             return self.advance(chat_id, cs)
 
-        if value == "__back":
-            cs.update({"stage": "bucket", "dest": None, "custom_dir": None,
-                       "prompt_id": msg["message_id"]})
-            return self.tg.edit(chat_id, msg["message_id"],
-                                self.prompt_text(cs), self.keyboard(cs))
-
-        if value == "__custom":
-            if not self.cfg.allow_custom:
-                return
-            cs["stage"] = "custom"
-            cs["prompt_id"] = msg["message_id"]
-            example = self.cfg.destinations[0].path
-            return self.tg.edit(
-                chat_id, msg["message_id"],
-                "Send a folder path relative to the root.\n"
-                "<i>e.g.</i> <code>%s</code>" % example,
-                self.back_keyboard())
-
         if value not in self.cfg.by_key:
             return
         cs["dest"] = value
-        if prefix == "q":
-            return self.finish(chat_id, cs, "-", via_edit=msg["message_id"])
-        cs["stage"] = "name"
-        cs["prompt_id"] = msg["message_id"]
-        self.tg.edit(chat_id, msg["message_id"],
-                     "Filing to <b>%s</b>.\n\nName it, or send <code>-</code> "
-                     "for <code>%s</code>."
-                     % (self.cfg.by_key[value].label,
-                        suggested_name(cs["active"], self.cfg.naming)),
-                     self.back_keyboard())
+        return self.finish(chat_id, cs, via_edit=msg["message_id"])
 
-    def on_custom_path(self, chat_id, cs, text):
-        try:
-            target = safe_join(self.cfg.root, render_path(
-                text, kind=cs["active"]["kind"], ext=cs["active"].get("ext", "")))
-        except (ValueError, ConfigError) as exc:
-            return self.tg.send(chat_id, "Bad path: %s. Try again." % exc)
-        cs["custom_dir"] = str(target)
-        cs["stage"] = "name"
-        rel = target.relative_to(self.cfg.root) if target != self.cfg.root else "."
-        sent = self.tg.send(chat_id, "Filing to <code>%s</code>.\n\nName it, or "
-                                     "send <code>-</code> for <code>%s</code>."
-                            % (rel, suggested_name(cs["active"], self.cfg.naming)),
-                            self.back_keyboard())
-        cs["prompt_id"] = sent.get("message_id")
-
-    def finish(self, chat_id, cs, name_text, via_edit=None):
+    def finish(self, chat_id, cs, via_edit=None):
         item = cs.get("active")
         if not item:
             return
-        name = (suggested_name(item, self.cfg.naming)
-                if name_text.strip() in ("-", ".") else name_text)
+        name = name_for(item, self.cfg.naming)
         try:
-            if cs.get("custom_dir"):
-                directory = Path(cs["custom_dir"])
-            else:
-                directory = self.cfg.resolve_dir(
-                    self.cfg.by_key[cs["dest"]], item["kind"], item.get("ext", ""))
+            directory = self.cfg.resolve_dir(
+                self.cfg.by_key[cs["dest"]], item["kind"], item.get("ext", ""))
             dest = file_item(item, directory, name, self.cfg)
         except Exception as exc:
             log("filing failed: %r" % (exc,))
@@ -961,6 +972,10 @@ class Bot:
         except ValueError:
             rel = dest
         log("filed -> %s" % rel)
+        history = cs.setdefault("history", [])
+        history.append({"at": int(time.time()), "path": str(rel),
+                        "kind": kind_word(item)})
+        del history[:-HISTORY_KEEP]
         # Remember enough to put it back, and the size and mtime it had when we
         # wrote it, so undo never touches a file that has since been edited.
         cs["last_filed"] = None
@@ -981,10 +996,8 @@ class Bot:
         else:
             self.tg.send(chat_id, confirmation, keyboard)
 
-        if cs.get("dest"):
-            cs["last_dest"] = cs["dest"]
         cs.update({"active": None, "stage": None, "dest": None,
-                   "custom_dir": None, "prompt_id": None})
+                   "prompt_id": None})
         self.advance(chat_id, cs)
 
     def undo_last(self, chat_id, cs, via_edit=None):
@@ -1035,6 +1048,10 @@ class Bot:
             rel = path.relative_to(self.cfg.root)
         except ValueError:
             rel = path
+        for entry in reversed(cs.get("history") or []):
+            if entry.get("path") == str(rel) and not entry.get("undone"):
+                entry["undone"] = True
+                break
         log("undone <- %s" % rel)
         say("↩️ Took <code>%s</code> back." % rel)
         self.advance(chat_id, cs)
@@ -1062,9 +1079,10 @@ def acquire_lock():
         existing = None
     if existing is not None and existing != os.getpid() and pid_alive(existing):
         raise SystemExit(
-            "Chute is already running as pid %d.\n"
-            "  Stop it first (chute stop), or delete %s if that pid is stale."
-            % (existing, LOCK_PATH))
+            "Chute is already running (pid %d).\n"
+            "  Stop it first with:  %s stop\n"
+            "  If you are sure nothing is running, delete %s and try again."
+            % (existing, cli_name(), LOCK_PATH))
     LOCK_PATH.write_text(str(os.getpid()))
 
 
@@ -1342,36 +1360,64 @@ def resolve_root(raw, cwd=None):
     return Path(os.path.normpath(str(path)))
 
 
+def looks_like_path(text):
+    """Distinguish a pasted path from a stray word like 'back' or 'help'."""
+    return (text.startswith(("/", "~", ".", "'", '"'))
+            or "/" in text or "\\" in text)
+
+
 def prompt_root():
     """Ask where files should go. Returns a usable folder, or None to abort."""
     cwd = Path.cwd()
+    # Running setup from Chute's own folder is the common first run; filing
+    # into the program folder is almost never what anyone wants, so suggest
+    # a fresh folder in their home instead.
+    in_repo = cwd == HERE
+    suggested = (Path.home() / "Chute") if in_repo else cwd
     print("\nWhere should files go on this computer?\n")
-    print("  1. %s" % cwd)
-    print("     (the folder you are running setup from)")
+    print("  1. %s" % suggested)
+    if in_repo:
+        print("     (a new folder in your home folder; it will be created)")
+    else:
+        print("     (the folder you are running setup from)")
     print("  2. Somewhere else, and I'll type the path")
     print("\nPick 1 or 2, or just paste a path. Type q to quit setup.")
 
     while True:
         answer = input("Choice [1]: ").strip() or "1"
-        if answer.lower() in ("q", "quit"):
+        low = answer.lower()
+        if low in ("q", "quit", "b", "back"):
             print("  Nothing saved. Run setup again whenever you like.")
             return None
         if answer == "1":
-            root = cwd
-        else:
+            root = suggested
+        elif answer == "2" or looks_like_path(answer):
             raw = answer if answer != "2" else input("Path: ").strip()
             try:
                 root = resolve_root(raw)
             except ValueError as exc:
                 print("  %s. Try again." % exc)
                 continue
+        else:
+            # A bare word here is a typo or a guessed command, not a path.
+            # Turning it into a folder offer next to the current directory
+            # helps nobody.
+            print("  Pick 1 or 2, paste a full path (starting with / or ~),")
+            print("  or type q to quit.")
+            continue
 
         if root.exists() and not root.is_dir():
             print("  %s is a file, not a folder. Try again." % root)
             continue
         if not root.exists():
-            make = input("  %s does not exist. Create it? [y/N]: "
-                         % root).strip().lower()
+            # Creating the folder we suggested needs no caution; a typed path
+            # that does not exist is more often a typo, so default to no.
+            if in_repo and root == suggested:
+                make = input("  %s does not exist. Create it? [Y/n]: "
+                             % root).strip().lower() or "y"
+            else:
+                make = input("  %s does not exist. Create it? [y/N]: "
+                             % root).strip().lower()
             if make not in ("y", "yes"):
                 print("  Nothing created. Pick somewhere else.")
                 continue
@@ -1385,24 +1431,152 @@ def prompt_root():
             print("  %s is not writable by you. Pick somewhere else." % root)
             continue
 
-        root = root.resolve()
-        # Offer to nest, so picking a home or project folder does not mean
-        # filed items land loose among whatever is already there.
-        if root.name != APP:
-            print("\n  Create a '%s' folder inside it, to keep filed items "
-                  "together?" % APP)
-            print("    y -> %s" % (root / APP))
-            print("    n -> %s" % root)
-            if input("  [y/N]: ").strip().lower() in ("y", "yes"):
-                nested = root / APP
-                try:
-                    nested.mkdir(parents=True, exist_ok=True)
-                except OSError as exc:
-                    print("  could not create it: %s" % exc)
+        return root.resolve()
+
+
+def subfolders_of(path):
+    try:
+        return sorted(p.name for p in path.iterdir()
+                      if p.is_dir() and not p.name.startswith("."))
+    except OSError:
+        return []
+
+
+def toggle_list(entries, chosen=(), allow_new=False):
+    """A checklist. entries is [(name, hint)]; returns chosen names in order.
+
+    Numbers toggle, several at once is fine, a is all, n is none, d or a
+    bare Enter finishes. With allow_new, anything that is not a number or a
+    command is taken as a new name: it joins the list, already turned on.
+    """
+    entries = list(entries)
+    chosen = set(chosen)
+    added = set()          # names typed in this session, removable with r
+    while True:
+        print()
+        for i, (name, hint) in enumerate(entries, 1):
+            line = "    %2d. [%s] %s" % (i, "x" if name in chosen else " ", name)
+            if hint:
+                line += "   (%s)" % hint
+            print(line)
+        print()
+        print("    %-8s turn one on or off, several at once is fine: 2 4 5"
+              % "number")
+        print("    %-8s turn on every one" % "a")
+        print("    %-8s turn them all off" % "n")
+        print("    %-8s done, %d selected" % ("d", len(chosen)))
+        if added:
+            print("    %-8s remove a name you typed, e.g. r %d"
+                  % ("r", len(entries)))
+        if allow_new:
+            print("\n  Or type a name of your own and it becomes a button,")
+            print("  e.g. Tax 2026")
+        raw = input("\n  > ").strip()
+        answer = raw.lower()
+        names = [n for n, _ in entries]
+
+        if answer == "a":
+            chosen = set(names)
+            continue
+        if answer == "n":
+            chosen = set()
+            continue
+        if answer in ("d", ""):
+            return [n for n, _ in entries if n in chosen]
+
+        tokens = [t for t in answer.replace(",", " ").split() if t]
+        if allow_new and tokens and tokens[0] == "r":
+            num = tokens[1] if len(tokens) > 1 else input(
+                "  Remove which number? ").strip()
+            if num.isdigit() and 1 <= int(num) <= len(entries):
+                name = entries[int(num) - 1][0]
+                if name in added:
+                    entries.pop(int(num) - 1)
+                    added.discard(name)
+                    chosen.discard(name)
+                    print("  Removed %s." % name)
+                else:
+                    print("  %s is part of the list; leaving it unticked "
+                          "is enough." % name)
+            else:
+                print("  There is no %s in that list." % num)
+            continue
+        if allow_new and not all(t.isdigit() for t in tokens):
+            # Not numbers, so it is a name for a new button.
+            if "/" in raw or "\\" in raw:
+                print("  One name per button, and no slashes.")
+                continue
+            if not ILLEGAL.sub("", raw).strip().strip(". "):
+                print("  There is nothing in that name I can make a "
+                      "folder from.")
+                continue
+            match = next((n for n in names if n.lower() == answer), None)
+            if match:
+                chosen.add(match)      # already listed: just turn it on
+                continue
+            # "a personal" is far more often the a-command plus a name than a
+            # button genuinely called that. Check before taking it literally.
+            first, _, rest = raw.partition(" ")
+            if rest.strip() and first.lower() in ("a", "n", "d", "r"):
+                if not ask_bool('  Add a button called "%s"?' % raw, False):
+                    print("  To add one, type just the name:  %s"
+                          % rest.strip())
                     continue
-                print("  using %s" % nested)
-                root = nested
-        return root
+            entries.append((raw, ""))
+            added.add(raw)
+            chosen.add(raw)
+            continue
+
+        typed_word = False
+        for token in tokens:
+            if token.isdigit() and 1 <= int(token) <= len(names):
+                name = names[int(token) - 1]
+                if name in chosen:
+                    chosen.remove(name)
+                else:
+                    chosen.add(name)
+            else:
+                print("  There is no %s in that list." % token)
+                typed_word = typed_word or not token.isdigit()
+        if typed_word and not allow_new:
+            print("  This list is only for choosing; new buttons with their")
+            print("  own names come in the next step, after d.")
+
+
+def pick_existing_folders(root, names):
+    """Offer each folder already in the root as a button, on or off.
+
+    Nothing here creates or renames anything: these folders exist already.
+    """
+    print("\n  %s already has %d folder(s) in it." % (root, len(names)))
+    print("  Turn on the ones you want as buttons. This is only a first pass:")
+    print("  the next step lets you add brand-new buttons with names of your")
+    print("  own, and %s config can change everything later." % cli_name())
+    return [{"label": n, "path": n}
+            for n in toggle_list([(n, "") for n in names])]
+
+
+# Offered when the chosen folder is empty, so the first buttons are a matter
+# of reacting to examples rather than inventing names from nothing.
+STARTER_BUTTONS = [
+    ("Inbox", "anything you'll sort out later"),
+    ("Photos", ""),
+    ("Documents", ""),
+    ("Receipts", ""),
+    ("Notes", "links and text you send"),
+]
+
+
+def pick_starter_buttons(root):
+    """Suggest first buttons for an empty root. Returns the chosen names."""
+    print("\n  %s is empty, so let's create your first buttons." % root)
+    print("\n  Each button is a folder. When you send the bot a photo or a")
+    print("  file, it shows your buttons; you tap one and the file lands in")
+    print("  that folder.")
+    print("\n  Here are some common ones. Turn on any you want, or type names")
+    print("  of your own; a folder is created for each. Not sure? Inbox alone")
+    print("  is a fine start, and everything can be changed later.")
+    return toggle_list(STARTER_BUTTONS, allow_new=True)
 
 
 def setup_destinations(root):
@@ -1415,14 +1589,39 @@ def setup_destinations(root):
     Returns the list of destinations, or None if the user asked to go back and
     choose a different root folder.
     """
-    print("\n  Type a button name and press Enter. Each one becomes a folder")
-    print("  of the same name inside %s." % root)
-    print("  A folder that is already there is reused, never overwritten.\n")
-    print("    undo    take back the last button")
-    print("    back    choose a different root folder")
-    print("    done    finish, or just press Enter on an empty line\n")
     dests = []
     made = {}   # label -> folder this run created, so undo can remove it again
+
+    existing = subfolders_of(root)
+    if existing:
+        dests = pick_existing_folders(root, existing)
+        if dests:
+            print("\n  %d button(s) from folders already there." % len(dests))
+    else:
+        for label in pick_starter_buttons(root):
+            folder = clean_name(label)
+            try:
+                target = safe_join(root, folder)
+                target.mkdir(parents=True, exist_ok=True)
+            except (ValueError, OSError) as exc:
+                print("  Could not create %s: %s" % (label, exc))
+                continue
+            dests.append({"label": label, "path": folder})
+            made[label] = target
+        if dests:
+            print("\n  Created: %s" % ", ".join(d["label"] for d in dests))
+
+    if dests:
+        print("\n  Now you can add brand-new buttons: type a name, and a folder")
+        print("  is created for it inside %s." % root)
+        print("  Press Enter on its own if you don't need any more.")
+    else:
+        print("\n  Type a button name and press Enter. Each one becomes a folder")
+        print("  of the same name inside %s." % root)
+        print("  A folder that is already there is reused, never overwritten.")
+    print("\n    undo    take back the last button")
+    print("    back    choose a different root folder")
+    print("    done    finish, or just press Enter on an empty line\n")
     while True:
         try:
             label = input("  Button %d: " % (len(dests) + 1)).strip()
@@ -1534,14 +1733,12 @@ def cmd_config(args):
         print("  Naming         %s%s%s"
               % (naming.get("style", "keep-spaces"),
                  ", lowercase" if naming.get("lowercase") else "",
-                 ", date prefix" if naming.get("date_prefix") else ""))
+                 ""))
         print("  Notes saved as %s%s"
               % (cap.get("format", "markdown"),
                  " with frontmatter" if cap.get("frontmatter", True) else ""))
         print("  Reply to strangers  %s"
               % ("yes" if sec.get("reply_to_strangers") else "no, stay silent"))
-        print("  'Other folder' button  %s"
-              % ("on" if sec.get("allow_custom_paths", True) else "off"))
         print("  Allowed Telegram ids   %s"
               % ", ".join(str(i) for i in data.get("allowed_user_ids") or []))
         print()
@@ -1552,6 +1749,7 @@ def cmd_config(args):
             ("4", "how links and notes are saved"),
             ("5", "who may use the bot"),
             ("6", "privacy and safety"),
+            ("7", "bot token"),
             ("s", "save and exit"),
             ("q", "quit without saving"),
         ], default="s")
@@ -1578,9 +1776,6 @@ def cmd_config(args):
                                "3": "snake"}[style]
             naming["lowercase"] = ask_bool("  Force names to lowercase?",
                                            bool(naming.get("lowercase")))
-            naming["date_prefix"] = ask_bool(
-                "  Put the date in front of every filename?",
-                bool(naming.get("date_prefix")))
             data["naming"] = naming
         elif choice == "4":
             fmt = ask_menu([("1", "Markdown .md, good for Obsidian and Logseq"),
@@ -1618,10 +1813,33 @@ def cmd_config(args):
             sec["reply_to_strangers"] = ask_bool(
                 "  Reply 'Not authorised' to strangers? Silence is safer",
                 bool(sec.get("reply_to_strangers")))
-            sec["allow_custom_paths"] = ask_bool(
-                "  Keep the 'Other folder' button, for filing anywhere "
-                "under the root?", bool(sec.get("allow_custom_paths", True)))
             data["security"] = sec
+        elif choice == "7":
+            tok = str(data.get("bot_token") or "")
+            print("\n  Current token ends in ...%s" % tok[-6:] if tok
+                  else "\n  No token stored.")
+            print("  You only need a new one if you revoked the old token in")
+            print("  BotFather, or you are switching to a different bot.")
+            new = clean_token(input("  Paste the new token, or press Enter "
+                                    "to keep the current one: "))
+            if not new:
+                pass
+            elif not TOKEN_RE.match(new):
+                print("  That does not look like a token; keeping the "
+                      "current one.")
+            else:
+                try:
+                    me = Telegram(new).call("getMe")
+                    data["bot_token"] = new
+                    print("  Connected to @%s. Token updated."
+                          % me.get("username"))
+                except NetworkError as exc:
+                    print("  Could not reach Telegram to check it: %s" % exc)
+                    if ask_bool("  Save it anyway?", False):
+                        data["bot_token"] = new
+                except Exception:
+                    print("  Telegram rejected that token; keeping the "
+                          "current one.")
         elif choice == "q":
             print("Nothing saved.")
             return 0
@@ -1635,32 +1853,96 @@ def cmd_config(args):
             save_json(path, data)
             os.chmod(path, 0o600)
             print("\nSaved %s" % path)
-            print("Apply it with:  chute restart")
+            print("If Chute is running, apply the change with:  %s restart"
+                  % cli_name())
             return 0
 
 
+def ask_token():
+    """Prompt for a bot token until one works. Returns (token, tg, me) or None."""
+    while True:
+        raw = clean_token(input("Bot token (or q to quit): "))
+        if raw.lower() in ("q", "quit"):
+            print("  Nothing saved. Run setup again whenever you like.")
+            return None
+        if not raw:
+            print("  Paste the whole line BotFather sent you.")
+            continue
+        if not TOKEN_RE.match(raw):
+            print("  That does not look like a token. It is one long line of")
+            print("  numbers, a colon, then letters, like")
+            print("      1234567890:AAF6yzXqML2wp3...")
+            print("  Copy the whole thing from BotFather and paste it here.")
+            continue
+        tg = Telegram(raw)
+        try:
+            me = tg.call("getMe")
+        except NetworkError as exc:
+            print("\nCould not reach Telegram, so the token was never "
+                  "checked.\n  %s" % exc)
+            return None
+        except ConfigError:
+            print("  Telegram says that token is not valid. Check you copied")
+            print("  the whole line, then paste it again.")
+            continue
+        except Exception as exc:
+            print("  That token did not work: %s" % exc)
+            continue
+        return raw, tg, me
+
+
+def wait_for_first_message(tg, offset, seconds=300):
+    """Poll until any message arrives. Returns (user_id, name, offset).
+
+    A TelegramConflict is re-raised: it means a Chute somewhere else holds
+    this bot, and no amount of waiting here fixes that.
+    """
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        try:
+            updates = tg.call("getUpdates", offset=offset, timeout=30)
+        except TelegramConflict:
+            raise
+        except Exception as exc:
+            print("  ...%s" % exc)
+            time.sleep(3)
+            continue
+        for u in updates:
+            offset = u["update_id"] + 1
+            frm = (u.get("message") or {}).get("from") or {}
+            if frm.get("id"):
+                name = frm.get("username") or frm.get("first_name") or "you"
+                return frm["id"], name, offset
+        print("  still waiting...")
+    return None, None, offset
+
+
 def cmd_setup(args):
+    cli = cli_name()
+    existing = find_config(args.config)
+    if existing:
+        print("Chute is already set up (%s)." % existing)
+        print("To change folders, buttons or anything else:  %s config" % cli)
+        if not ask_bool("\nThrow that away and start over from scratch?", False):
+            return 0
+        print()
+
     print("Chute setup\n")
-    print("1. In Telegram open @BotFather, send /newbot, follow the prompts.")
-    print("2. Paste the token it gives you here.\n")
-    token = input("Bot token: ").strip()
-    if not token:
-        print("No token given, aborting.")
+    print("First you need a bot of your own on Telegram. It takes a minute:\n")
+    print("  1. In Telegram, search for BotFather and open it.")
+    print("  2. Send it the message:  /newbot")
+    print("  3. It asks for a display name. Anything you like.")
+    print("  4. It asks for a username, which must end in 'bot'.")
+    print("  5. It replies with a token, one long line of numbers and letters.")
+    print("     Copy it and paste it here.\n")
+    print("Used Chute before, maybe on another computer? Don't make a second")
+    print("bot. Send BotFather /mybots, pick your bot, and choose API Token")
+    print("to see the same token again.\n")
+    got = ask_token()
+    if got is None:
         return 1
-    tg = Telegram(token)
-    try:
-        me = tg.call("getMe")
-    except NetworkError as exc:
-        print("\nCould not reach Telegram, so the token was never checked.\n  %s"
-              % exc)
-        return 1
-    except ConfigError as exc:
-        print("\n%s" % exc)
-        return 1
-    except Exception as exc:
-        print("\nThat token did not work: %s" % exc)
-        return 1
-    print("\nConnected as @%s." % me.get("username"))
+    token, tg, me = got
+    print("\nConnected to your bot, @%s." % me.get("username"))
 
     # Loops so that 'back' inside the button step returns to the root choice.
     destinations = None
@@ -1676,27 +1958,32 @@ def cmd_setup(args):
         print("-" * 62)
         destinations = setup_destinations(root)
 
-    print("\nNow open Telegram, find @%s, and send it any message." % me.get("username"))
-    print("Waiting (Ctrl-C to stop)...")
-    offset, user_id, deadline = 0, None, time.time() + 300
-    while time.time() < deadline and user_id is None:
+    print("\nLast step: Chute needs to know which Telegram account is yours,")
+    print("so that nobody else can ever use this bot.")
+    print("\nOpen this link and send the bot any message, even just 'hi':")
+    print("\n    https://t.me/%s\n" % me.get("username"))
+    print("Waiting for it...")
+    offset, user_id = 0, None
+    while user_id is None:
         try:
-            updates = tg.call("getUpdates", offset=offset, timeout=30)
-        except Exception as exc:
-            print("  ...%s" % exc)
-            time.sleep(3)
+            user_id, name, offset = wait_for_first_message(tg, offset)
+        except TelegramConflict:
+            print("\nYour bot is still connected to Chute on another computer.")
+            print("Only one computer can hold a bot at a time.")
+            print("\nOn that computer, run:  chute stop")
+            print("(If it is gone for good, revoke the token with BotFather's")
+            print("/revoke and run setup again with the new one.)")
+            if not ask_bool("\nStopped it? Try again now?", True):
+                print("Nothing saved. Run setup again whenever you like.")
+                return 1
             continue
-        for u in updates:
-            offset = u["update_id"] + 1
-            frm = (u.get("message") or {}).get("from") or {}
-            if frm.get("id"):
-                user_id = frm["id"]
-                print("\nGot it. You are %s (id %s)."
-                      % (frm.get("username") or frm.get("first_name"), user_id))
-                break
-    if user_id is None:
-        print("Timed out without a message. Run setup again.")
-        return 1
+        if user_id is None:
+            if not ask_bool("\nFive minutes and no message yet. Keep waiting?",
+                            True):
+                print("Nothing saved. Run setup again whenever you like.")
+                return 1
+            print("Waiting...")
+    print("\nGot it. This bot now answers only to %s (id %s)." % (name, user_id))
 
     target = Path(args.config).expanduser() if args.config else HERE / "config.json"
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -1710,9 +1997,26 @@ def cmd_setup(args):
     })
     os.chmod(target, 0o600)
     save_json(STATE_PATH, {"offset": offset, "chats": {}})
-    print("\nWrote %s (readable only by you)." % target)
-    print("\nStart it with:      chute install")
-    print("Change anything with: chute config")
+    print("\nSetup is done. Your settings are in %s (readable only by you)."
+          % target)
+    print("\nOne more command starts Chute now and at every login:")
+    print("\n    %s install" % cli)
+    print("\nThat is the only start you ever do by hand. From then on Chute")
+    print("comes back on its own every time you log in, including after a")
+    print("restart. Day to day:")
+    print("\n    %s status     is it running?" % cli)
+    print("    %s log        watch files arrive" % cli)
+    print("    %s stop       pause it; %s start resumes" % (cli, cli))
+    print("    %s config     change folders, buttons, anything" % cli)
+    print("\nOnce it is running, filing works like this:")
+    print("\n    1. Send the bot anything: a photo, a file, audio, video,")
+    print("       or a link.")
+    print("    2. Tap a folder button. It is saved there at once.")
+    print("\nNames are date plus type, like '2026-08-20 1848 Image.jpg'.")
+    print("A caption becomes the filename instead. Wrong folder? /undo in")
+    print("the chat takes the last filed item back. /help repeats this.")
+    print("\nRun %s install now, then send your bot a photo to try it out."
+          % cli)
     return 0
 
 
@@ -1734,6 +2038,7 @@ def cmd_check(args):
         print("Bot:    @%s  ok" % me.get("username"))
     except ConfigError as exc:
         print("Bot:    FAILED\n  %s" % exc)
+        print("  Update the token with:  %s config" % cli_name())
         return 1
     except NetworkError as exc:
         print("Bot:    unreachable\n  %s" % exc)
@@ -1741,9 +2046,8 @@ def cmd_check(args):
     except Exception as exc:
         print("Bot:    unreachable - %s" % exc)
     print("Users:  %s" % ", ".join(str(x) for x in sorted(cfg.allowed)))
-    print("Limits: %.0f MB max, %d blocked extensions, custom paths %s"
-          % (cfg.max_bytes / 1048576.0, len(cfg.blocked_ext),
-             "on" if cfg.allow_custom else "off"))
+    print("Limits: %.0f MB max, %d blocked extensions"
+          % (cfg.max_bytes / 1048576.0, len(cfg.blocked_ext)))
     print("\nDestinations:")
     for dest in cfg.destinations:
         for kind in ("image", "document", "media", "text"):
@@ -1755,6 +2059,7 @@ def cmd_check(args):
                          "exists" if target.is_dir() else "will be created"))
     for w in warnings:
         print("\nWarning: %s" % w)
+    print("\nEverything looks good.")
     return 0
 
 
@@ -1785,6 +2090,10 @@ class Args:
 
 
 def main():
+    if sys.version_info < (3, 9):
+        print("Chute needs Python 3.9 or newer; this is Python %d.%d."
+              % sys.version_info[:2], file=sys.stderr)
+        return 2
     args = Args(sys.argv[1:])
     if args.action in ("version", "--version", "-v"):
         print("%s %s" % (APP, VERSION))
@@ -1801,10 +2110,17 @@ def main():
             return cmd_config(args)
         if args.action == "run":
             return cmd_run(args)
+    except KeyboardInterrupt:
+        if args.action in ("setup", "config"):
+            print("\nStopped. Nothing was saved.")
+            return 1
+        raise
     except ConfigError as exc:
-        print("Config error: %s" % exc, file=sys.stderr)
+        print("Problem with your settings: %s" % exc, file=sys.stderr)
         return 2
-    print(__doc__)
+    print("Unknown command %r. Commands: setup, config, check, run, version."
+          % args.action, file=sys.stderr)
+    print("Full help:  %s help" % cli_name(), file=sys.stderr)
     return 1
 
 
@@ -1813,4 +2129,4 @@ if __name__ == "__main__":
         sys.exit(main())
     except KeyboardInterrupt:
         release_lock()
-        print("\nstopped")
+        print("\nChute stopped.")

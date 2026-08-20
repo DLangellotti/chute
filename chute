@@ -17,9 +17,29 @@ LABEL="chute"
 PY="${CHUTE_PYTHON:-$(command -v python3 || true)}"
 
 if [ -z "$PY" ]; then
-  echo "python3 not found. Install Python 3.9 or newer." >&2
+  echo "Python 3 was not found on this computer, and Chute needs it." >&2
+  echo "On a Mac it comes with the Xcode command line tools:  xcode-select --install" >&2
+  echo "On Linux, install the python3 package." >&2
   exit 1
 fi
+
+# How to tell the user to invoke us: bare 'chute' only works once it is on PATH.
+CLI="./chute"
+command -v chute >/dev/null 2>&1 && CLI="chute"
+
+# Does a config exist anywhere chute would look for one?
+have_config() {
+  [ -n "${CHUTE_CONFIG:-}" ] && [ -f "$CHUTE_CONFIG" ] && return 0
+  [ -f "$HERE/config.json" ] && return 0
+  [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/chute/config.json" ]
+}
+
+# Pid of a chute running in a terminal (fg), if any.
+fg_pid() {
+  [ -f "$HERE/chute.lock" ] || return 1
+  LP="$(cat "$HERE/chute.lock" 2>/dev/null)"
+  [ -n "$LP" ] && kill -0 "$LP" 2>/dev/null && echo "$LP"
+}
 
 OS="$(uname -s)"
 case "$OS" in
@@ -39,7 +59,7 @@ render_unit() {
   echo "wrote $UNIT"
 }
 
-no_service() { echo "Service management is not wired up for $OS. Use './chute fg'." >&2; exit 1; }
+no_service() { echo "Background-service commands are not available on $OS. Run Chute in a terminal instead:  $CLI fg" >&2; exit 1; }
 
 usage() {
   cat <<'CHUTE_HELP'
@@ -113,39 +133,111 @@ case "${1:-status}" in
               systemctl --user enable --now "$LABEL" ;;
       *) no_service ;;
     esac
-    echo "installed and started; it will come back at login" ;;
+    echo
+    echo "Chute is running, and from now on it starts on its own at every"
+    echo "login. Nothing more to do."
+    echo
+    echo "Try it: send your bot a photo. Watch it arrive with:  $CLI log"
+    echo "Check on it any time with:  $CLI status" ;;
 
   start)
+    if [ ! -f "$UNIT" ]; then
+      echo "Chute is not installed as a background service yet."
+      echo "Install it with:  $CLI install"
+      exit 1
+    fi
     case "$OS" in
-      Darwin) launchctl bootstrap "gui/$UID" "$UNIT" ;;
-      Linux)  systemctl --user start "$LABEL" ;;
+      Darwin) launchctl bootstrap "gui/$UID" "$UNIT" 2>/dev/null \
+                && echo "Chute is running." \
+                || echo "Chute was already running." ;;
+      Linux)  systemctl --user start "$LABEL" && echo "Chute is running." ;;
       *) no_service ;;
-    esac
-    echo started ;;
+    esac ;;
 
   stop)
     case "$OS" in
-      Darwin) launchctl bootout "gui/$UID/$LABEL" ;;
-      Linux)  systemctl --user stop "$LABEL" ;;
+      Darwin)
+        if launchctl bootout "gui/$UID/$LABEL" 2>/dev/null; then
+          echo "Chute is stopped. Anything sent to the bot in the next 24 hours"
+          echo "will be picked up when it starts again."
+        elif PID="$(fg_pid)"; then
+          echo "The background service is not running, but Chute is running in a"
+          echo "terminal window (pid $PID). Press Ctrl-C in that window to stop it."
+        else
+          echo "Chute was not running."
+        fi ;;
+      Linux)  systemctl --user stop "$LABEL" 2>/dev/null && echo "Chute is stopped." \
+                || echo "Chute was not running." ;;
       *) no_service ;;
-    esac
-    echo stopped ;;
+    esac ;;
 
   restart)
+    if [ ! -f "$UNIT" ]; then
+      echo "Chute is not installed as a background service yet."
+      echo "Install it with:  $CLI install"
+      exit 1
+    fi
     case "$OS" in
-      Darwin) launchctl kickstart -k "gui/$UID/$LABEL" ;;
+      Darwin) launchctl kickstart -k "gui/$UID/$LABEL" 2>/dev/null \
+                || launchctl bootstrap "gui/$UID" "$UNIT" 2>/dev/null || true ;;
       Linux)  systemctl --user restart "$LABEL" ;;
       *) no_service ;;
     esac
-    echo restarted ;;
+    echo "Chute restarted with the current settings." ;;
 
   status)
+    if ! have_config; then
+      echo "Chute is not set up yet. Run:  $CLI setup"
+      exit 0
+    fi
+    RUNNING=""
     case "$OS" in
-      Darwin) launchctl print "gui/$UID/$LABEL" 2>/dev/null \
-                | grep -E "state|pid|last exit" || echo "not running" ;;
-      Linux)  systemctl --user --no-pager status "$LABEL" || true ;;
+      Darwin)
+        if INFO="$(launchctl print "gui/$UID/$LABEL" 2>/dev/null)"; then
+          PID="$(printf '%s\n' "$INFO" | awk '/^\tpid = /{print $3}')"
+          if [ -n "$PID" ]; then
+            echo "Chute is running (pid $PID)."
+            RUNNING=1
+          else
+            echo "Chute is installed but not running right now."
+            echo "Start it with:  $CLI start"
+          fi
+        elif PID="$(fg_pid)"; then
+          echo "Chute is running in a terminal window (pid $PID)."
+          RUNNING=1
+        else
+          echo "Chute is set up but not installed as a background service."
+          echo "Install it with:  $CLI install   (or run it in this window:  $CLI fg)"
+        fi ;;
+      Linux)
+        if systemctl --user --no-pager --quiet is-active "$LABEL" 2>/dev/null; then
+          echo "Chute is running."
+          RUNNING=1
+        elif PID="$(fg_pid)"; then
+          echo "Chute is running in a terminal window (pid $PID)."
+          RUNNING=1
+        else
+          echo "Chute is not running. Install it with:  $CLI install"
+        fi ;;
       *) no_service ;;
-    esac ;;
+    esac
+    # A running process never reloads its code or settings; the lock file's
+    # age is the process start, so newer sources mean a stale bot.
+    if [ -n "$RUNNING" ] && [ -f "$HERE/chute.lock" ]; then
+      if [ "$HERE/chute.py" -nt "$HERE/chute.lock" ] \
+         || { [ -f "$HERE/config.json" ] && [ "$HERE/config.json" -nt "$HERE/chute.lock" ]; }; then
+        echo
+        echo "Heads up: the code or settings changed after Chute started, so it"
+        echo "is still running the old version. Pick up the changes with:"
+        echo "    $CLI restart"
+      fi
+    fi
+    if [ -f "$LOG" ]; then
+      echo
+      echo "Last few log lines:"
+      tail -n 3 "$LOG" | sed 's/^/  /'
+      [ -n "$RUNNING" ] || echo "  (follow the log any time with:  $CLI log)"
+    fi ;;
 
   uninstall)
     case "$OS" in
@@ -153,9 +245,18 @@ case "${1:-status}" in
       Linux)  systemctl --user disable --now "$LABEL" 2>/dev/null || true ;;
     esac
     rm -f "$UNIT"
-    echo "service removed. config.json and your files are untouched." ;;
+    echo "The background service is removed. Your settings and filed files are"
+    echo "untouched; bring it back any time with:  $CLI install" ;;
 
-  log) tail -f "$LOG" ;;
+  log)
+    if [ ! -f "$LOG" ]; then
+      echo "No log yet, Chute has not run on this computer."
+      echo "Start it with:  $CLI install"
+      exit 0
+    fi
+    echo "Following the log. Press Ctrl-C to stop watching (Chute keeps running)."
+    echo
+    tail -n 20 -f "$LOG" ;;
 
   *)
     echo "chute: unknown command '$1'" >&2

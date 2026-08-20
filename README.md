@@ -3,10 +3,10 @@
 Send a file to a Telegram bot, have it land in the right folder on a computer you
 control.
 
-Chute is a single Python script with no dependencies. It watches a Telegram bot
-for anything you send it, asks which folder the item belongs in, asks what to
-call it, and writes it to disk. It polls rather than listening, so it needs no
-public URL, no port forwarding and no server.
+Chute is a single Python script with no dependencies. Send its Telegram bot
+anything: photos, files, audio, video, links, forwarded messages. Tap a folder
+button and it is written to that folder on your machine. It polls rather than
+listening, so it needs no public URL, no port forwarding and no server.
 
 ```
 You:  [photo] "q3 pricing table"
@@ -14,13 +14,9 @@ Bot:  Image · 412 KB · "q3 pricing table"
 
       Where does this go?
       [ 📡 Work     ] [ 🏠 Personal ]
-      [ 🗂 Misc     ] [ 📂 Other    ]
-      [ ✖️ Discard  ]
+      [ 🗂 Misc     ] [ ✖️ Discard  ]
 
 You:  *taps Work*
-Bot:  Filing to Work. Name it, or send - for "q3 pricing table".
-
-You:  -
 Bot:  ✅ Work/Attachments/q3 pricing table.jpg
 ```
 
@@ -44,18 +40,20 @@ cd chute
 token back.
 
 It then asks where files should go, offering the folder you ran it from or any
-path you type. A `~` is expanded, a relative path is resolved against the current
-directory, and a folder dragged in from Finder works whether it arrives quoted or
-with its spaces backslash-escaped. If the folder does not exist it offers to
-create it. It also offers to make a `chute/` subfolder inside your choice, so
-filed items stay together instead of landing loose among whatever is already
-there.
+path you type. A `~` is expanded, and a folder dragged in from Finder works
+whether it arrives quoted or with its spaces backslash-escaped. If the folder
+does not exist it offers to create it. (When you run setup from Chute's own
+folder, it suggests a fresh `~/Chute` instead, so files never mix with the
+program.)
 
-Finally it asks you to name the buttons. Type a name, press Enter, and a folder
-of that name is created under the root. A folder that already exists is reused,
-never overwritten. Press Enter on an empty line when you are done, then message
-the bot once so it can record your user id. Sub-paths and per-kind routing are
-left to `chute config`.
+Then come the buttons. If the folder already has folders inside it, each one is
+offered as a button: turn on the ones you want. If it is empty, a starter list
+(Inbox, Photos, Receipts...) is offered instead, and you can type names of your
+own alongside. After that, type any further names, one per line; each becomes a
+folder under the root, and folders that already exist are reused, never
+overwritten. Press Enter on an empty line when you are done, then message the
+bot once so it can record your user id. Sub-paths and per-kind routing are left
+to `chute config`.
 
 `install` generates a launchd agent on macOS or a systemd user service on Linux,
 pointed at wherever you cloned the repo. On anything else, run `./chute fg`
@@ -111,19 +109,21 @@ Paths accept `{year}`, `{month}`, `{day}`, `{date}`, `{time}`, `{kind}` and
 
 ### Naming
 
+Files name themselves: date, time and type, like `2026-08-20 1848 Image.jpg`
+or `2026-08-20 1851 Document.pdf`. A caption overrides that, so captioning a
+photo `contract p3` files it as `contract p3.jpg`. A second file under the
+same name gets a numeric suffix rather than overwriting anything.
+
 ```json
 "naming": {
   "style": "keep-spaces",
   "lowercase": false,
-  "date_prefix": false,
   "max_length": 120
 }
 ```
 
-`style` is `keep-spaces`, `kebab` or `snake`. `date_prefix` puts `YYYY-MM-DD ` in
-front of the final name. Characters the filesystem rejects are stripped, and
-existing files are never overwritten: a second `Router diagram.png` is saved as
-`Router diagram 2.png`.
+`style` is `keep-spaces`, `kebab` or `snake` and shapes how those names are
+written (`2026-08-20-1848-image.jpg` under kebab plus lowercase).
 
 ### Text capture
 
@@ -139,24 +139,17 @@ More examples in [`examples/`](examples/).
 
 ## Using it
 
-Send a photo, tap a folder, send a name. Send `-` to accept the suggestion.
+Send anything, tap a folder. That is the whole flow: the file is saved the
+moment you tap, named by date, time and type (`2026-08-20 1848 Image.jpg`). A
+caption overrides the name, as in the example above. A taken name gets a
+numeric suffix rather than overwriting.
 
-A caption becomes that suggestion, so captioning the photo as you send it turns
-filing into two taps. For documents the suggestion is the original filename. For
-links it is the site and the URL slug.
-
-After the first file a `🔁 Work, auto-name` button appears. It reuses the last
-folder and skips the name prompt, which is the fast path for a batch of
-screenshots. Send a whole album and Chute queues them, filing one at a time and
-keeping a live count of how many are still waiting.
-
-`📂 Other folder` takes any path under the root, including the date tokens above.
+Send a whole album and Chute queues it, filing one item per tap and keeping a
+live count of how many are still waiting.
 
 ### Changing your mind
 
-Tapping a folder is not a commitment. The name prompt carries a `⬅️ Back`
-button that returns you to the folder list, and `/back` does the same from the
-keyboard. `✖️ Discard` drops the item.
+`✖️ Discard` drops the item before filing.
 
 Every confirmation carries `↩️ Undo`, and `/undo` works too. Undo takes the file
 back out of your folder tree and puts the item at the front of the queue, so you
@@ -172,8 +165,21 @@ alone. Anything else is a job for your file manager.
 | Voice note, audio, video | `path`, or `by_kind.media` |
 | Link or forwarded text | `path`, or `by_kind.text`, as a note |
 
-Commands: `/status` for what is pending, `/cancel` to drop it, `/help` for a
-summary of your own configuration.
+Commands: `/history` for what was filed where and when, `/status` for what is
+pending, `/cancel` to drop it, `/help` for a summary of your own configuration.
+
+## Changing settings
+
+Everything lives behind one menu; no file editing needed:
+
+```
+./chute config
+```
+
+Folders and buttons, the root folder, filename style, how notes are saved, who
+may use the bot, the privacy switches, and the bot token itself. It validates
+before saving, so a broken combination is refused with a reason rather than
+saved.
 
 ## Running it
 
@@ -194,6 +200,30 @@ that would escape your root.
 
 Config is looked up in this order: `--config PATH`, then `$CHUTE_CONFIG`, then
 `config.json` next to the script, then `$XDG_CONFIG_HOME/chute/config.json`.
+
+## Moving to a new computer
+
+If you still have the old `config.json`, no setup is needed. Copy it into the
+Chute folder on the new machine, then:
+
+```
+./chute check      # confirms the token, folders and settings still hold
+./chute install
+```
+
+If the files folder lives at a different path on the new machine, `check` says
+so and `./chute config` lets you point at the new location without losing your
+buttons.
+
+Without the old config, run `./chute setup` as usual, but don't create a second
+bot: send BotFather `/mybots`, pick your bot, and choose API Token to get the
+same token again. If the folder tree came across too, setup offers every folder
+it finds as a button, so rebuilding takes a few keystrokes.
+
+Either way, stop Chute on the old machine first (`./chute stop` there). Telegram
+lets one computer hold a bot at a time; setup on the new machine says so plainly
+if the old one is still connected. Two computers filing at once needs two bots,
+one config each.
 
 ## When your machine is off
 
@@ -219,8 +249,7 @@ no way to recover an update past it.
 **Send and forget, file later.** The default, and enough for most people. You
 send things through the day, the machine picks them up whenever it is next
 awake. Works as long as you are not away for more than a day. Clearing a backlog
-is quick: send each item with a caption and the `🔁` repeat button files it in
-two taps.
+is quick: one tap files each item.
 
 **Keep the machine awake.** Reasonable for a desktop or a laptop that lives on a
 charger. On macOS:

@@ -55,7 +55,8 @@ check("nothing left staged", list(chute.STAGING.iterdir()), [])
 check("no state created for their chat", str(ATTACKER) in bot.state["chats"], False)
 
 section("stranger tries to hijack the owner's pending item")
-bot.handle(msg(20, OWNER, photo=[{"file_id": "mine", "file_size": 9}]))
+bot.handle(msg(20, OWNER, caption="my photo",
+               photo=[{"file_id": "mine", "file_size": 9}]))
 check("owner's item is pending", bot.chat_state(OWNER)["active"] is not None, True)
 hijack = {"update_id": 21, "callback_query": {
     "id": "c", "from": {"id": ATTACKER}, "data": "b:work",
@@ -70,8 +71,8 @@ section("owner still works")
 bot.handle({"update_id": 22, "callback_query": {
     "id": "c2", "from": {"id": OWNER}, "data": "b:work",
     "message": {"message_id": 1, "chat": {"id": OWNER}}}})
-bot.handle(msg(23, OWNER, text="my photo"))
-check("owner's file lands", (root / "Work/Attachments/my photo.jpg").exists(), True)
+check("owner's tap files it under the caption",
+      (root / "Work/Attachments/my photo.jpg").exists(), True)
 
 section("replying to strangers is opt-in")
 loud = chute.Bot(make_config(root, security={"reply_to_strangers": True}))
