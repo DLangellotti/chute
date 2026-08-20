@@ -1,0 +1,28 @@
+{
+  "bot_token": "",
+  "allowed_user_ids": [],
+  "root": "~/Obsidian/MyVault",
+
+  "destinations": [
+    {
+      "label": "📡 Work",
+      "path": "Work/Attachments",
+      "by_kind": {
+        "media": "Media/Work",
+        "text": "Work/Inbox"
+      }
+    },
+    {
+      "label": "🏠 Personal",
+      "path": "Personal/Attachments",
+      "by_kind": {
+        "media": "Media/Personal",
+        "text": "Personal/Inbox"
+      }
+    },
+    { "label": "🗂 Misc", "path": "Misc/Attachments" }
+  ],
+
+  "naming": { "style": "keep-spaces" },
+  "text_capture": { "format": "markdown", "frontmatter": true, "tags": ["inbox"] }
+}

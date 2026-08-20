@@ -1,0 +1,16 @@
+[Unit]
+Description=Chute, a Telegram bot that files things into a folder tree
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__DIR__
+ExecStart=__PYTHON__ __SCRIPT__ run
+Restart=always
+RestartSec=30
+StandardOutput=append:__LOG__
+StandardError=append:__LOG__
+
+[Install]
+WantedBy=default.target

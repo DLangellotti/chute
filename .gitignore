@@ -1,0 +1,6 @@
+config.json
+chute.lock
+state.json
+state.json.tmp
+staging/
+chute.log

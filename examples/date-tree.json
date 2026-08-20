@@ -1,0 +1,11 @@
+{
+  "bot_token": "",
+  "allowed_user_ids": [],
+  "root": "~/Archive",
+  "destinations": [
+    { "label": "📷 Camera", "path": "Photos/{year}/{month}" },
+    { "label": "🎙 Voice", "path": "Audio/{year}" },
+    { "label": "📥 Everything else", "path": "Inbox/{date}" }
+  ],
+  "naming": { "style": "snake", "lowercase": true }
+}

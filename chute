@@ -1,0 +1,165 @@
+#!/bin/bash
+# Chute CLI. Wraps chute.py and whatever service manager this OS uses.
+set -eu
+
+# Follow symlinks back to the real script, so `chute` works when linked onto
+# PATH (e.g. ~/.local/bin/chute -> /path/to/repo/chute).
+SOURCE="$0"
+while [ -L "$SOURCE" ]; do
+  LINKDIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  case "$SOURCE" in /*) ;; *) SOURCE="$LINKDIR/$SOURCE" ;; esac
+done
+HERE="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+SCRIPT="$HERE/chute.py"
+LOG="$HERE/chute.log"
+LABEL="chute"
+PY="${CHUTE_PYTHON:-$(command -v python3 || true)}"
+
+if [ -z "$PY" ]; then
+  echo "python3 not found. Install Python 3.9 or newer." >&2
+  exit 1
+fi
+
+OS="$(uname -s)"
+case "$OS" in
+  Darwin) UNIT="$HOME/Library/LaunchAgents/$LABEL.plist"
+          TMPL="$HERE/service/launchd.plist.tmpl" ;;
+  Linux)  UNIT="$HOME/.config/systemd/user/$LABEL.service"
+          TMPL="$HERE/service/systemd.service.tmpl" ;;
+  *)      UNIT=""; TMPL="" ;;
+esac
+
+render_unit() {
+  [ -n "$TMPL" ] || { echo "No service template for $OS. Run './chute fg' under your own supervisor." >&2; exit 1; }
+  mkdir -p "$(dirname "$UNIT")"
+  sed -e "s|__PYTHON__|$PY|g" -e "s|__SCRIPT__|$SCRIPT|g" \
+      -e "s|__DIR__|$HERE|g" -e "s|__LOG__|$LOG|g" \
+      -e "s|__LABEL__|$LABEL|g" "$TMPL" > "$UNIT"
+  echo "wrote $UNIT"
+}
+
+no_service() { echo "Service management is not wired up for $OS. Use './chute fg'." >&2; exit 1; }
+
+usage() {
+  cat <<'CHUTE_HELP'
+chute - send a file to a Telegram bot, it lands in the right folder
+
+USAGE
+  chute <command> [--config PATH]
+
+FIRST RUN
+  setup        Create the bot, pick a root folder, record your Telegram user id.
+               Interactive. Writes config.json (chmod 600).
+  check        Validate config, token and every destination folder.
+  install      Start it now and at every login (launchd on macOS, systemd on
+               Linux). Runs check first and refuses to install a broken config.
+
+DAY TO DAY
+  config       Change anything: folders, naming, who may use the bot.
+               A menu, not a text editor. Run chute restart afterwards.
+  status       Is it running? (default when no command is given)
+  log          Follow the log. Ctrl-C to stop watching.
+  restart      Pick up changes made with config, or edits to chute.py.
+  start        Start the installed service.
+  stop         Stop it. Telegram holds messages for 24h, so nothing is lost.
+
+TROUBLESHOOTING
+  fg           Run in this terminal instead of the background, printing
+               everything. Stop the service first: chute stop
+  test         Run the test suite. No network, no dependencies.
+  version      Print the version.
+
+REMOVING
+  uninstall    Remove the service. Leaves config.json and your files alone.
+
+OPTIONS
+  --config PATH   Use a specific config file. Otherwise chute looks at
+                  $CHUTE_CONFIG, then ./config.json, then
+                  ${XDG_CONFIG_HOME:-~/.config}/chute/config.json
+
+IN TELEGRAM
+  /status      What is pending
+  /cancel      Drop everything pending
+  /help        The folders you configured, and how naming works
+
+Docs: README.md    Threat model: SECURITY.md
+CHUTE_HELP
+}
+
+case "${1:-status}" in
+  help|-h|--help) usage; exit 0 ;;
+  setup)   exec "$PY" "$SCRIPT" setup "${@:2}" ;;
+  check)   exec "$PY" "$SCRIPT" check "${@:2}" ;;
+  config)  exec "$PY" "$SCRIPT" config "${@:2}" ;;
+  fg|run)  exec "$PY" "$SCRIPT" run "${@:2}" ;;
+  version) exec "$PY" "$SCRIPT" version ;;
+
+  test)
+    fail=0
+    for t in "$HERE"/tests/test_*.py; do
+      echo "== $(basename "$t")"
+      "$PY" "$t" || fail=1
+    done
+    exit $fail ;;
+
+  install)
+    "$PY" "$SCRIPT" check
+    render_unit
+    case "$OS" in
+      Darwin) launchctl bootout "gui/$UID/$LABEL" 2>/dev/null || true
+              launchctl bootstrap "gui/$UID" "$UNIT" ;;
+      Linux)  systemctl --user daemon-reload
+              systemctl --user enable --now "$LABEL" ;;
+      *) no_service ;;
+    esac
+    echo "installed and started; it will come back at login" ;;
+
+  start)
+    case "$OS" in
+      Darwin) launchctl bootstrap "gui/$UID" "$UNIT" ;;
+      Linux)  systemctl --user start "$LABEL" ;;
+      *) no_service ;;
+    esac
+    echo started ;;
+
+  stop)
+    case "$OS" in
+      Darwin) launchctl bootout "gui/$UID/$LABEL" ;;
+      Linux)  systemctl --user stop "$LABEL" ;;
+      *) no_service ;;
+    esac
+    echo stopped ;;
+
+  restart)
+    case "$OS" in
+      Darwin) launchctl kickstart -k "gui/$UID/$LABEL" ;;
+      Linux)  systemctl --user restart "$LABEL" ;;
+      *) no_service ;;
+    esac
+    echo restarted ;;
+
+  status)
+    case "$OS" in
+      Darwin) launchctl print "gui/$UID/$LABEL" 2>/dev/null \
+                | grep -E "state|pid|last exit" || echo "not running" ;;
+      Linux)  systemctl --user --no-pager status "$LABEL" || true ;;
+      *) no_service ;;
+    esac ;;
+
+  uninstall)
+    case "$OS" in
+      Darwin) launchctl bootout "gui/$UID/$LABEL" 2>/dev/null || true ;;
+      Linux)  systemctl --user disable --now "$LABEL" 2>/dev/null || true ;;
+    esac
+    rm -f "$UNIT"
+    echo "service removed. config.json and your files are untouched." ;;
+
+  log) tail -f "$LOG" ;;
+
+  *)
+    echo "chute: unknown command '$1'" >&2
+    echo >&2
+    usage >&2
+    exit 1 ;;
+esac
