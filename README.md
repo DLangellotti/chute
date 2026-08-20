@@ -9,7 +9,7 @@ public URL or open port.
 Python 3.9+ is the only requirement.
 
 ```
-git clone https://github.com/YOU/chute.git
+git clone https://github.com/DLangellotti/chute.git
 cd chute
 ./chute setup      # bot token, folders, your Telegram account
 ./chute install    # start now, and at every login
