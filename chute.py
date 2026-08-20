@@ -1296,26 +1296,60 @@ def prompt_root():
         return root
 
 
-def suggest_destinations(root):
-    """A starting list drawn from the folders already in the root."""
-    try:
-        tops = sorted(p.name for p in root.iterdir()
-                      if p.is_dir() and not p.name.startswith("."))
-    except OSError:
-        tops = []
-    if not tops:
-        return []
-    print("\n  Folders already in %s:" % root)
-    for i, name in enumerate(tops[:20], 1):
-        print("    %2d. %s" % (i, name))
-    picked = input("\n  Start with any of these as buttons? "
-                   "(numbers, comma separated, or Enter to start empty): ").strip()
-    out = []
-    for chunk in picked.replace(" ", "").split(","):
-        if chunk.isdigit() and 1 <= int(chunk) <= len(tops[:20]):
-            name = tops[int(chunk) - 1]
-            out.append({"label": name, "path": name})
-    return out
+def setup_destinations(root):
+    """First-run buttons: type a name, get a folder of that name. Nothing else.
+
+    Deliberately simpler than edit_destinations. Setup is the wrong moment to
+    browse a folder tree; anyone who wants sub-paths or per-kind routing can
+    run chute config afterwards.
+    """
+    print("\n  Type a button name and press Enter. Each one becomes a folder")
+    print("  of the same name inside %s." % root)
+    print("  A name that already exists is reused, not overwritten.")
+    print("  Press Enter on an empty line when you are done.\n")
+    dests = []
+    while True:
+        try:
+            label = input("  Button %d: " % (len(dests) + 1)).strip()
+        except EOFError:
+            label = ""
+        if not label:
+            if dests:
+                break
+            print("  You need at least one button.")
+            continue
+        if any(d["label"].lower() == label.lower() for d in dests):
+            print("  There is already a button called %s." % label)
+            continue
+        if "/" in label or "\\" in label:
+            print("  One name per button, and no slashes. Sub-folders and "
+                  "per-kind routing come later with:  chute config")
+            continue
+        # clean_name falls back to a date stamp when nothing usable is left,
+        # which would be a baffling folder to end up with. Catch that here.
+        if not ILLEGAL.sub("", label).strip().strip(". "):
+            print("  There is nothing in that name I can make a folder from.")
+            continue
+        folder = clean_name(label)
+        try:
+            target = safe_join(root, folder)
+        except ValueError as exc:
+            print("  Cannot use that as a folder name: %s" % exc)
+            continue
+        if target == root:
+            print("  That leaves nothing to name a folder with.")
+            continue
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            print("  Could not create %s: %s" % (target, exc))
+            continue
+        dests.append({"label": label, "path": folder})
+        print("      -> %s" % target)
+        if len(dests) == 12:
+            print("\n  That is 12 buttons, about as many as fits a phone screen.")
+    show_destinations(dests, root)
+    return dests
 
 
 def cmd_config(args):
@@ -1486,10 +1520,10 @@ def cmd_setup(args):
     print("\nFiling into %s" % root)
 
     print("\n" + "-" * 62)
-    print("Now set up the buttons you'll see in Telegram. Each one is a folder.")
+    print("Now name the buttons you'll see in Telegram. Each one is a folder.")
     print("You can change all of this later with:  chute config")
     print("-" * 62)
-    destinations = edit_destinations(root, suggest_destinations(root))
+    destinations = setup_destinations(root)
 
     print("\nNow open Telegram, find @%s, and send it any message." % me.get("username"))
     print("Waiting (Ctrl-C to stop)...")

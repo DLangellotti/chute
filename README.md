@@ -51,8 +51,11 @@ create it. It also offers to make a `chute/` subfolder inside your choice, so
 filed items stay together instead of landing loose among whatever is already
 there.
 
-Finally it lists the folders under that root so you can pick which become
-buttons, and asks you to message the bot once so it can record your user id.
+Finally it asks you to name the buttons. Type a name, press Enter, and a folder
+of that name is created under the root. A folder that already exists is reused,
+never overwritten. Press Enter on an empty line when you are done, then message
+the bot once so it can record your user id. Sub-paths and per-kind routing are
+left to `chute config`.
 
 `install` generates a launchd agent on macOS or a systemd user service on Linux,
 pointed at wherever you cloned the repo. On anything else, run `./chute fg`

@@ -181,6 +181,65 @@ with Script(["s"]):
     check("a template start falls back to the root",
           chute.browse_folder(br, start="Photos/{year}"), "")
 
+section("naming the buttons")
+buttons = tmp / "Buttons"
+buttons.mkdir()
+with Script(["Receipts", "Work Photos", ""]):
+    check("one folder per button",
+          chute.setup_destinations(buttons),
+          [{"label": "Receipts", "path": "Receipts"},
+           {"label": "Work Photos", "path": "Work Photos"}])
+check("first folder created", (buttons / "Receipts").is_dir(), True)
+check("spaces kept in the folder name",
+      (buttons / "Work Photos").is_dir(), True)
+
+(buttons / "Already There").mkdir()
+(buttons / "Already There" / "keep.txt").write_text("x")
+with Script(["Already There", ""]):
+    check("an existing folder is reused", chute.setup_destinations(buttons),
+          [{"label": "Already There", "path": "Already There"}])
+check("existing contents untouched",
+      (buttons / "Already There" / "keep.txt").exists(), True)
+
+with Script(["Notes", "notes", "", ""]):
+    check("a duplicate label is refused", chute.setup_destinations(buttons),
+          [{"label": "Notes", "path": "Notes"}])
+
+with Script(["", "Inbox", ""]):
+    check("blank first answer asks again", chute.setup_destinations(buttons),
+          [{"label": "Inbox", "path": "Inbox"}])
+
+with Script(["../escape", "Safe", ""]):
+    check("traversal refused", chute.setup_destinations(buttons),
+          [{"label": "Safe", "path": "Safe"}])
+check("nothing created outside the root",
+      (tmp / "escape").exists(), False)
+
+with Script([".hidden", ""]):
+    check("a leading dot is dropped, not made into a dot-folder",
+          chute.setup_destinations(buttons),
+          [{"label": ".hidden", "path": "hidden"}])
+check("no dot-folder created", (buttons / ".hidden").exists(), False)
+check("plain folder created instead", (buttons / "hidden").is_dir(), True)
+
+with Script(["Talks/2026", "Talks", ""]):
+    check("a slash is refused rather than flattened",
+          chute.setup_destinations(buttons),
+          [{"label": "Talks", "path": "Talks"}])
+check("nothing named Talks2026", (buttons / "Talks2026").exists(), False)
+
+with Script(["...", "Plain", ""]):
+    check("a name with nothing usable in it is refused",
+          chute.setup_destinations(buttons),
+          [{"label": "Plain", "path": "Plain"}])
+
+with Script(["Bills: 2026", ""]):
+    check("an illegal character is dropped from the folder name",
+          chute.setup_destinations(buttons),
+          [{"label": "Bills: 2026", "path": "Bills 2026"}])
+check("folder created under the cleaned name",
+      (buttons / "Bills 2026").is_dir(), True)
+
 os.chdir("/")
 shutil.rmtree(tmp, ignore_errors=True)
 sys.exit(report())
