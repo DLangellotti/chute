@@ -235,6 +235,90 @@ second = chute.file_item({"kind": "image", "staged": staged("m2.jpg"),
 check("first keeps the plain name", first.name, "2026-08-20 1848 Image.jpg")
 check("second gets a suffix", second.name, "2026-08-20 1848 Image 2.jpg")
 
+section("moving a filed file")
+def filed(name, folder="Inbox", data=b"HELLO"):
+    """Write a file where Chute would have, and build its record."""
+    d = root / folder
+    d.mkdir(parents=True, exist_ok=True)
+    f = d / name
+    f.write_bytes(data)
+    st = f.stat()
+    return {"path": str(f), "stem": f.stem, "ext": f.suffix, "kind": "image",
+            "dest": "inbox", "size": st.st_size, "mtime": int(st.st_mtime),
+            "at": int(chute.time.time())}
+
+rec = filed("a.jpg")
+moved = chute.move_filed(rec, root / "Work", root)
+check("lands in the new folder", moved, root / "Work/a.jpg")
+check("and is gone from the old one", (root / "Inbox/a.jpg").exists(), False)
+check("contents survive", moved.read_bytes(), b"HELLO")
+
+rec2 = filed("a.jpg", data=b"SECOND")
+moved2 = chute.move_filed(rec2, root / "Work", root)
+check("a name already taken is suffixed", moved2.name, "a 2.jpg")
+check("the first file is untouched", moved.read_bytes(), b"HELLO")
+
+same = filed("b.jpg")
+before_path = Path(same["path"])
+again = chute.move_filed(same, root / "Inbox", root)
+check("moving into its own folder does nothing", again, before_path)
+check("and does not make a second copy",
+      len(list((root / "Inbox").glob("b*.jpg"))), 1)
+
+edited = filed("c.jpg")
+Path(edited["path"]).write_bytes(b"CHANGED BY HAND")
+onward = chute.move_filed(edited, root / "Work", root)
+check("an edited file still moves", onward.exists(), True)
+check("carrying its new contents", onward.read_bytes(), b"CHANGED BY HAND")
+
+gone = filed("d.jpg")
+Path(gone["path"]).unlink()
+raises("a file that walked off is not chased",
+       lambda: chute.move_filed(gone, root / "Work", root), chute.NotAsFiled)
+
+restated = filed("e.jpg")
+after = chute.move_filed(restated, root / "Work", root)
+chute.restat(restated, after, "work")
+check("the record follows the file", restated["path"], str(after))
+check("and remembers which button it sits under", restated["dest"], "work")
+
+section("deleting a filed file")
+doomed = filed("x.jpg")
+chute.delete_filed(doomed, root)
+check("the file is gone", Path(doomed["path"]).exists(), False)
+
+touched = filed("y.jpg")
+Path(touched["path"]).write_bytes(b"EDITED SINCE")
+raises("an edited file is not deleted",
+       lambda: chute.delete_filed(touched, root), chute.NotAsFiled)
+check("it survives", Path(touched["path"]).exists(), True)
+
+strayed = filed("z.jpg")
+Path(strayed["path"]).rename(root / "Inbox/renamed by hand.jpg")
+raises("a renamed file is not deleted",
+       lambda: chute.delete_filed(strayed, root), chute.NotAsFiled)
+check("the renamed copy survives",
+      (root / "Inbox/renamed by hand.jpg").exists(), True)
+
+section("remembering which message owns which file")
+filed_map = {}
+now = 1755600000
+for i in range(5):
+    chute.remember(filed_map, 100 + i, {"path": "p%d" % i, "at": now}, now=now)
+check("each message keyed separately", sorted(filed_map), 
+      ["100", "101", "102", "103", "104"])
+
+stale = {"old": {"path": "old", "at": now - chute.FILED_TTL - 1}}
+chute.remember(stale, 200, {"path": "new", "at": now}, now=now)
+check("anything older than a week is forgotten", sorted(stale), ["200"])
+
+many = {}
+for i in range(chute.FILED_KEEP + 25):
+    chute.remember(many, i, {"path": "p%d" % i, "at": now + i}, now=now)
+check("and the count is capped", len(many), chute.FILED_KEEP)
+check("keeping the newest", str(chute.FILED_KEEP + 24) in many, True)
+check("dropping the oldest", "0" in many, False)
+
 section("text capture")
 note = chute.file_item(
     {"kind": "text", "text": "read this https://a.com",

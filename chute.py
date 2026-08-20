@@ -43,6 +43,8 @@ API_ROOT = "https://api.telegram.org"
 POLL_TIMEOUT = 50                     # seconds Telegram holds getUpdates open
 HISTORY_KEEP = 200                    # filings remembered per chat for /history
 HISTORY_SHOW = 15                     # lines /history prints at once
+FILED_KEEP = 200                      # movable messages remembered per chat
+FILED_TTL = 7 * 86400                 # and only for a week
 TG_DOWNLOAD_CEILING = 20 * 1024 * 1024   # Bot API hard limit, not ours to raise
 
 KINDS = ("image", "document", "media", "text")
@@ -713,6 +715,97 @@ def discard(item):
             os.remove(staged)
         except OSError:
             pass
+
+
+def rel_to(root, path):
+    """Path as the user thinks of it: relative to their root, if it is inside."""
+    try:
+        return str(Path(path).relative_to(root))
+    except ValueError:
+        return str(path)
+
+
+class NotAsFiled(Exception):
+    """The file is not the one Chute wrote, so Chute will not touch it."""
+
+
+def verify_filed(record, root, strict=True):
+    """Return the file's path, if it is still the one Chute wrote.
+
+    Always refuses when the file has been moved away or deleted. With strict,
+    also refuses when the bytes have changed since Chute wrote them: nothing is
+    removed on the strength of a stale record. Moving is deliberately lenient,
+    because a photo edited in place should still be filable.
+    """
+    path = Path(record["path"])
+    shown = rel_to(root, path)
+    try:
+        st = path.stat()
+    except OSError:
+        raise NotAsFiled("<code>%s</code> is not where I left it, so I have "
+                         "not touched anything." % shown)
+    if strict and (st.st_size != record.get("size")
+                   or int(st.st_mtime) != record.get("mtime")):
+        raise NotAsFiled("<code>%s</code> has changed since I filed it, so I "
+                         "have left it alone." % shown)
+    return path
+
+
+def move_filed(record, directory, root):
+    """Move an already-filed file into directory. Returns its new path.
+
+    Moving into the folder it already sits in is a no-op rather than a rename
+    to "name 2": tapping the folder a file is already in means leave it there,
+    and a double tap must not multiply the file.
+    """
+    src = verify_filed(record, root, strict=False)
+    directory.mkdir(parents=True, exist_ok=True)
+    if src.parent.resolve() == directory.resolve():
+        return src
+    dest = unique_path(directory, record.get("stem") or src.stem, src.suffix)
+    shutil.move(str(src), str(dest))
+    return dest
+
+
+def delete_filed(record, root):
+    """Remove a filed file, but only if it is untouched since Chute wrote it."""
+    path = verify_filed(record, root, strict=True)
+    path.unlink()
+    return path
+
+
+def restat(record, path, dest_key):
+    """Re-record where the file is and what it looks like, after every write.
+
+    The stat is always read from the file that now exists rather than carried
+    across from the source: a move onto a filesystem with coarser timestamps
+    lands on a different integer second, and a record that disagreed with the
+    disk would refuse every later tap.
+    """
+    st = path.stat()
+    record.update({"path": str(path), "size": st.st_size,
+                   "mtime": int(st.st_mtime), "dest": dest_key,
+                   "at": int(time.time())})
+    return record
+
+
+def remember(filed, message_id, record, now=None):
+    """Store a record against its message, and forget the stale ones.
+
+    Bounded twice over: nothing older than a week, and never more than
+    FILED_KEEP messages. Telegram will not let a bot edit a message older than
+    48 hours anyway, so a week is already generous.
+    """
+    now = int(now if now is not None else time.time())
+    filed[str(message_id)] = record
+    for key, rec in list(filed.items()):
+        if now - int(rec.get("at") or 0) > FILED_TTL:
+            del filed[key]
+    if len(filed) > FILED_KEEP:
+        oldest = sorted(filed.items(), key=lambda kv: int(kv[1].get("at") or 0))
+        for key, _ in oldest[:len(filed) - FILED_KEEP]:
+            del filed[key]
+    return filed
 
 
 # ---------------------------------------------------------------- bot
