@@ -642,7 +642,8 @@ class Bot:
     def chat_state(self, chat_id):
         return self.state["chats"].setdefault(str(chat_id), {
             "queue": [], "active": None, "stage": None, "dest": None,
-            "prompt_id": None, "last_dest": None, "custom_dir": None})
+            "prompt_id": None, "last_dest": None, "custom_dir": None,
+            "last_filed": None})
 
     def persist(self):
         save_json(STATE_PATH, self.state)
@@ -670,6 +671,16 @@ class Bot:
         rows.append([{"text": "✖️ Discard", "callback_data": "b:__cancel"}])
         return rows
 
+    @staticmethod
+    def back_keyboard():
+        """Shown once a folder is picked, so a wrong tap costs one more tap."""
+        return [[{"text": "⬅️ Back", "callback_data": "b:__back"},
+                 {"text": "✖️ Discard", "callback_data": "b:__cancel"}]]
+
+    @staticmethod
+    def undo_keyboard():
+        return [[{"text": "↩️ Undo", "callback_data": "z:last"}]]
+
     def help_text(self):
         lines = ["<b>%s</b> %s" % (APP.title(), VERSION), "",
                  "Send an image, a PDF, a voice note or a link and I'll ask "
@@ -680,7 +691,12 @@ class Bot:
         lines += ["", "A caption becomes the suggested filename, so you can send "
                       "the picture with its name attached and just tap a folder, "
                       "then send <code>-</code>.", "",
-                  "/status  what's pending", "/cancel  drop everything pending",
+                  "Tapped the wrong folder? Use ⬅️ Back, or /back. Filed "
+                  "something by mistake? ↩️ Undo on the confirmation, or "
+                  "/undo, puts it back in the queue.", "",
+                  "/status  what's pending", "/back  return to the folder list",
+                  "/undo  take back the last filed item",
+                  "/cancel  drop everything pending",
                   "/help  this message"]
         return "\n".join(lines)
 
@@ -792,6 +808,14 @@ class Bot:
             if cs.get("last_dest") in self.cfg.by_key:
                 lines.append("Last folder: %s" % self.cfg.by_key[cs["last_dest"]].label)
             return self.tg.send(chat_id, "\n".join(lines))
+        if cmd == "undo":
+            return self.undo_last(chat_id, cs)
+        if cmd == "back":
+            if cs.get("active") and cs.get("stage") in ("name", "custom"):
+                cs.update({"stage": "bucket", "dest": None, "custom_dir": None})
+                return self.prompt(chat_id, cs)
+            return self.tg.send(chat_id, "Nothing to go back to. /undo puts the "
+                                         "last filed item back.")
         if cmd == "cancel":
             dropped = 0
             if cs.get("active"):
@@ -852,11 +876,15 @@ class Bot:
                                else None)
         cs = self.chat_state(chat_id)
         self.tg.ack(cq["id"])
+        prefix, _, value = (cq.get("data") or "").partition(":")
+
+        # Undo runs after filing, when nothing is pending, so it comes first.
+        if prefix == "z":
+            return self.undo_last(chat_id, cs, via_edit=msg["message_id"])
+
         if not cs.get("active"):
             return self.tg.edit(chat_id, msg["message_id"],
                                 "That item is no longer pending.")
-
-        prefix, _, value = (cq.get("data") or "").partition(":")
 
         if value == "__cancel":
             discard(cs["active"])
@@ -864,15 +892,23 @@ class Bot:
             self.tg.edit(chat_id, msg["message_id"], "Discarded.")
             return self.advance(chat_id, cs)
 
+        if value == "__back":
+            cs.update({"stage": "bucket", "dest": None, "custom_dir": None,
+                       "prompt_id": msg["message_id"]})
+            return self.tg.edit(chat_id, msg["message_id"],
+                                self.prompt_text(cs), self.keyboard(cs))
+
         if value == "__custom":
             if not self.cfg.allow_custom:
                 return
             cs["stage"] = "custom"
+            cs["prompt_id"] = msg["message_id"]
             example = self.cfg.destinations[0].path
             return self.tg.edit(
                 chat_id, msg["message_id"],
                 "Send a folder path relative to the root.\n"
-                "<i>e.g.</i> <code>%s</code>" % example)
+                "<i>e.g.</i> <code>%s</code>" % example,
+                self.back_keyboard())
 
         if value not in self.cfg.by_key:
             return
@@ -880,11 +916,13 @@ class Bot:
         if prefix == "q":
             return self.finish(chat_id, cs, "-", via_edit=msg["message_id"])
         cs["stage"] = "name"
+        cs["prompt_id"] = msg["message_id"]
         self.tg.edit(chat_id, msg["message_id"],
                      "Filing to <b>%s</b>.\n\nName it, or send <code>-</code> "
                      "for <code>%s</code>."
                      % (self.cfg.by_key[value].label,
-                        suggested_name(cs["active"], self.cfg.naming)))
+                        suggested_name(cs["active"], self.cfg.naming)),
+                     self.back_keyboard())
 
     def on_custom_path(self, chat_id, cs, text):
         try:
@@ -895,9 +933,11 @@ class Bot:
         cs["custom_dir"] = str(target)
         cs["stage"] = "name"
         rel = target.relative_to(self.cfg.root) if target != self.cfg.root else "."
-        self.tg.send(chat_id, "Filing to <code>%s</code>.\n\nName it, or send "
-                              "<code>-</code> for <code>%s</code>."
-                     % (rel, suggested_name(cs["active"], self.cfg.naming)))
+        sent = self.tg.send(chat_id, "Filing to <code>%s</code>.\n\nName it, or "
+                                     "send <code>-</code> for <code>%s</code>."
+                            % (rel, suggested_name(cs["active"], self.cfg.naming)),
+                            self.back_keyboard())
+        cs["prompt_id"] = sent.get("message_id")
 
     def finish(self, chat_id, cs, name_text, via_edit=None):
         item = cs.get("active")
@@ -921,16 +961,82 @@ class Bot:
         except ValueError:
             rel = dest
         log("filed -> %s" % rel)
+        # Remember enough to put it back, and the size and mtime it had when we
+        # wrote it, so undo never touches a file that has since been edited.
+        cs["last_filed"] = None
+        try:
+            st = dest.stat()
+            record = {k: item.get(k) for k in
+                      ("id", "kind", "ext", "orig_name", "caption", "text",
+                       "meta", "media_group_id", "size")}
+            record.update({"path": str(dest), "written": st.st_size,
+                           "mtime": int(st.st_mtime)})
+            cs["last_filed"] = record
+        except OSError:
+            pass
         confirmation = "✅ <code>%s</code>" % rel
+        keyboard = self.undo_keyboard() if cs.get("last_filed") else None
         if via_edit:
-            self.tg.edit(chat_id, via_edit, confirmation)
+            self.tg.edit(chat_id, via_edit, confirmation, keyboard)
         else:
-            self.tg.send(chat_id, confirmation)
+            self.tg.send(chat_id, confirmation, keyboard)
 
         if cs.get("dest"):
             cs["last_dest"] = cs["dest"]
         cs.update({"active": None, "stage": None, "dest": None,
                    "custom_dir": None, "prompt_id": None})
+        self.advance(chat_id, cs)
+
+    def undo_last(self, chat_id, cs, via_edit=None):
+        """Put the last filed item back in the queue, if it is untouched."""
+        def say(text):
+            if via_edit:
+                return self.tg.edit(chat_id, via_edit, text)
+            return self.tg.send(chat_id, text)
+
+        rec = cs.get("last_filed")
+        if not rec:
+            return say("Nothing to undo. Only the last filed item can come "
+                       "back, and only until the next one.")
+        path = Path(rec["path"])
+        try:
+            st = path.stat()
+        except OSError:
+            cs["last_filed"] = None
+            return say("<code>%s</code> is not where I left it, so I have not "
+                       "touched anything." % rec["path"])
+        if st.st_size != rec.get("written") or int(st.st_mtime) != rec.get("mtime"):
+            cs["last_filed"] = None
+            return say("<code>%s</code> has changed since I filed it, so I have "
+                       "left it alone." % rec["path"])
+
+        item = {k: v for k, v in rec.items()
+                if k not in ("path", "written", "mtime")}
+        if item.get("kind") == "text":
+            # A note was written from the text we still hold, so removing the
+            # file loses nothing: the item goes back in the queue intact.
+            try:
+                path.unlink()
+            except OSError as exc:
+                return say("Could not take that back: %s" % exc)
+        else:
+            try:
+                STAGING.mkdir(parents=True, exist_ok=True)
+                staged = unique_path(STAGING, str(item.get("id") or "undo"),
+                                     item.get("ext") or "")
+                shutil.move(str(path), str(staged))
+            except OSError as exc:
+                return say("Could not take that back: %s" % exc)
+            item["staged"] = str(staged)
+
+        cs["last_filed"] = None
+        cs["queue"].insert(0, item)
+        try:
+            rel = path.relative_to(self.cfg.root)
+        except ValueError:
+            rel = path
+        log("undone <- %s" % rel)
+        say("↩️ Took <code>%s</code> back." % rel)
         self.advance(chat_id, cs)
 
 
@@ -1243,10 +1349,13 @@ def prompt_root():
     print("  1. %s" % cwd)
     print("     (the folder you are running setup from)")
     print("  2. Somewhere else, and I'll type the path")
-    print("\nPick 1 or 2, or just paste a path.")
+    print("\nPick 1 or 2, or just paste a path. Type q to quit setup.")
 
     while True:
         answer = input("Choice [1]: ").strip() or "1"
+        if answer.lower() in ("q", "quit"):
+            print("  Nothing saved. Run setup again whenever you like.")
+            return None
         if answer == "1":
             root = cwd
         else:
@@ -1302,22 +1411,57 @@ def setup_destinations(root):
     Deliberately simpler than edit_destinations. Setup is the wrong moment to
     browse a folder tree; anyone who wants sub-paths or per-kind routing can
     run chute config afterwards.
+
+    Returns the list of destinations, or None if the user asked to go back and
+    choose a different root folder.
     """
     print("\n  Type a button name and press Enter. Each one becomes a folder")
     print("  of the same name inside %s." % root)
-    print("  A name that already exists is reused, not overwritten.")
-    print("  Press Enter on an empty line when you are done.\n")
+    print("  A folder that is already there is reused, never overwritten.\n")
+    print("    undo    take back the last button")
+    print("    back    choose a different root folder")
+    print("    done    finish, or just press Enter on an empty line\n")
     dests = []
+    made = {}   # label -> folder this run created, so undo can remove it again
     while True:
         try:
             label = input("  Button %d: " % (len(dests) + 1)).strip()
         except EOFError:
             label = ""
-        if not label:
+
+        if label.lower() in ("undo", "u"):
+            if not dests:
+                print("  Nothing to undo yet.")
+                continue
+            gone = dests.pop()
+            folder = made.pop(gone["label"], None)
+            if folder is None:
+                print("  Took back %s. The folder was already there, so it "
+                      "stays." % gone["label"])
+            else:
+                try:
+                    folder.rmdir()
+                    print("  Took back %s and removed the empty folder."
+                          % gone["label"])
+                except OSError:
+                    print("  Took back %s. Something is in %s already, so the "
+                          "folder stays." % (gone["label"], folder))
+            continue
+
+        if label.lower() in ("back", "b"):
+            if made:
+                print("  Going back. The %d folder(s) just created stay on "
+                      "disk; nothing has been saved to a config yet."
+                      % len(made))
+            return None
+
+        if not label or label.lower() in ("done", "d"):
             if dests:
                 break
-            print("  You need at least one button.")
+            print("  You need at least one button. Type 'back' to choose a "
+                  "different root folder.")
             continue
+
         if any(d["label"].lower() == label.lower() for d in dests):
             print("  There is already a button called %s." % label)
             continue
@@ -1339,13 +1483,17 @@ def setup_destinations(root):
         if target == root:
             print("  That leaves nothing to name a folder with.")
             continue
+        existed = target.is_dir()
         try:
             target.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             print("  Could not create %s: %s" % (target, exc))
             continue
         dests.append({"label": label, "path": folder})
-        print("      -> %s" % target)
+        if not existed:
+            made[label] = target
+        print("      -> %s%s  (type 'undo' to take it back)"
+              % (target, "" if not existed else "  [already there]"))
         if len(dests) == 12:
             print("\n  That is 12 buttons, about as many as fits a phone screen.")
     show_destinations(dests, root)
@@ -1514,16 +1662,19 @@ def cmd_setup(args):
         return 1
     print("\nConnected as @%s." % me.get("username"))
 
-    root = prompt_root()
-    if root is None:
-        return 1
-    print("\nFiling into %s" % root)
+    # Loops so that 'back' inside the button step returns to the root choice.
+    destinations = None
+    while destinations is None:
+        root = prompt_root()
+        if root is None:
+            return 1
+        print("\nFiling into %s" % root)
 
-    print("\n" + "-" * 62)
-    print("Now name the buttons you'll see in Telegram. Each one is a folder.")
-    print("You can change all of this later with:  chute config")
-    print("-" * 62)
-    destinations = setup_destinations(root)
+        print("\n" + "-" * 62)
+        print("Now name the buttons you'll see in Telegram. Each one is a folder.")
+        print("You can change all of this later with:  chute config")
+        print("-" * 62)
+        destinations = setup_destinations(root)
 
     print("\nNow open Telegram, find @%s, and send it any message." % me.get("username"))
     print("Waiting (Ctrl-C to stop)...")

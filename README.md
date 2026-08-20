@@ -152,6 +152,19 @@ keeping a live count of how many are still waiting.
 
 `📂 Other folder` takes any path under the root, including the date tokens above.
 
+### Changing your mind
+
+Tapping a folder is not a commitment. The name prompt carries a `⬅️ Back`
+button that returns you to the folder list, and `/back` does the same from the
+keyboard. `✖️ Discard` drops the item.
+
+Every confirmation carries `↩️ Undo`, and `/undo` works too. Undo takes the file
+back out of your folder tree and puts the item at the front of the queue, so you
+can file it somewhere else. It only ever touches the last thing filed, and only
+while that file is exactly as Chute wrote it: if the size or the modification
+time has changed, or you have moved or renamed it, Chute says so and leaves it
+alone. Anything else is a job for your file manager.
+
 | What you send | Where it goes |
 | --- | --- |
 | Photo, image, sticker | `path`, or `by_kind.image` |

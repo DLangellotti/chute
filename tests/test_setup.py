@@ -240,6 +240,53 @@ with Script(["Bills: 2026", ""]):
 check("folder created under the cleaned name",
       (buttons / "Bills 2026").is_dir(), True)
 
+section("undo and back")
+undo_root = tmp / "Undo"
+undo_root.mkdir()
+with Script(["Receipts", "undo", "Bills", ""]):
+    check("undo drops the last button", chute.setup_destinations(undo_root),
+          [{"label": "Bills", "path": "Bills"}])
+check("undo removed the folder it had created",
+      (undo_root / "Receipts").exists(), False)
+check("the kept button still has its folder",
+      (undo_root / "Bills").is_dir(), True)
+
+with Script(["u", "Only", ""]):
+    check("undo with nothing to undo just asks again",
+          chute.setup_destinations(undo_root),
+          [{"label": "Only", "path": "Only"}])
+
+with Script(["Bills", "undo", "Kept", ""]):
+    check("undo leaves a folder that was already there",
+          chute.setup_destinations(undo_root),
+          [{"label": "Kept", "path": "Kept"}])
+check("pre-existing folder survives undo", (undo_root / "Bills").is_dir(), True)
+
+full = undo_root / "Full"
+full.mkdir()
+(full / "file.txt").write_text("x")
+with Script(["Full", "undo", "Empty Enough", ""]):
+    chute.setup_destinations(undo_root)
+check("undo never deletes a folder with something in it",
+      (full / "file.txt").exists(), True)
+
+with Script(["Half Done", "back"]):
+    check("back returns None so setup can re-ask for the root",
+          chute.setup_destinations(undo_root), None)
+check("folders made before going back stay on disk",
+      (undo_root / "Half Done").is_dir(), True)
+
+with Script(["done", "One", "done"]):
+    check("done is refused while empty, then finishes once there is a button",
+          chute.setup_destinations(undo_root),
+          [{"label": "One", "path": "One"}])
+
+section("quitting the root prompt")
+with Script(["q"]):
+    check("q leaves setup", chute.prompt_root(), None)
+with Script(["quit"]):
+    check("quit leaves setup", chute.prompt_root(), None)
+
 os.chdir("/")
 shutil.rmtree(tmp, ignore_errors=True)
 sys.exit(report())

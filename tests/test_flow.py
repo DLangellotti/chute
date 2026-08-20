@@ -15,7 +15,7 @@ chute.STATE_PATH = root.parent / "state.json"
 chute.LOG_PATH = root.parent / "chute.log"
 OWNER = CHAT = 555
 
-sent, edits, mid = [], [], [100]
+sent, edits, edit_kb, mid = [], [], [], [100]
 
 
 class FakeTelegram:
@@ -32,6 +32,7 @@ class FakeTelegram:
 
     def edit(self, chat, m, text, keyboard=None):
         edits.append(text)
+        edit_kb.append(keyboard)
         return {}
 
     def ack(self, cid, text=None):
@@ -194,6 +195,116 @@ section("status")
 resumed.handle(text(70, "/status"))
 check("reports idle", "Nothing in progress." in sent[-1][0], True)
 check("reports the root", str(root) in sent[-1][0], True)
+
+def keys_of(keyboard):
+    return [b["callback_data"] for row in keyboard or [] for b in row]
+
+
+section("backing out of a wrong folder")
+# The restart section left this instance holding an item its twin already
+# filed, so clear it before driving the flow again.
+bot.handle(text(79, "/cancel"))
+sent.clear(); edits.clear(); edit_kb.clear()
+bot.handle(photo(80, caption="wrong tap"))
+bot.handle(tap(81, "b:work"))
+check("name prompt offers a way back", keys_of(edit_kb[-1]),
+      ["b:__back", "b:__cancel"])
+bot.handle(tap(82, "b:__back"))
+check("back returns to the folder question",
+      "Where does this go?" in edits[-1], True)
+check("folder buttons are there again", "b:personal" in keys_of(edit_kb[-1]),
+      True)
+bot.handle(tap(83, "b:personal"))
+bot.handle(text(84, "Second thoughts"))
+check("filed where the second tap said",
+      (root / "Personal/Attachments/Second thoughts.jpg").exists(), True)
+check("nothing left under the first folder",
+      (root / "Work/Attachments/Second thoughts.jpg").exists(), False)
+
+bot.handle(photo(85))
+bot.handle(tap(86, "b:work"))
+bot.handle(text(87, "/back"))
+check("/back does the same", "Where does this go?" in sent[-1][0], True)
+bot.handle(tap(88, "b:__custom"))
+check("the custom path prompt has a way back too", keys_of(edit_kb[-1]),
+      ["b:__back", "b:__cancel"])
+bot.handle(tap(89, "b:__back"))
+check("back out of the custom path prompt",
+      "Where does this go?" in edits[-1], True)
+bot.handle(text(90, "/cancel"))
+
+section("undo a filing")
+sent.clear(); edits.clear(); edit_kb.clear()
+bot.handle(photo(91, caption="undo me"))
+bot.handle(tap(92, "b:work"))
+bot.handle(text(93, "-"))
+filed = root / "Work/Attachments/undo me.jpg"
+check("filed to begin with", filed.exists(), True)
+check("confirmation offers undo", keys_of(sent[-1][1]), ["z:last"])
+bot.handle(tap(94, "z:last"))
+check("the file is out of the tree again", filed.exists(), False)
+check("and back in staging", len(list(chute.STAGING.iterdir())), 1)
+check("re-prompted for a folder", "Where does this go?" in sent[-1][0], True)
+bot.handle(tap(95, "b:personal"))
+bot.handle(text(96, "-"))
+check("refiled where the second answer said",
+      (root / "Personal/Attachments/undo me.jpg").exists(), True)
+check("staging clean again", list(chute.STAGING.iterdir()), [])
+
+bot.handle(text(97, "/undo"))
+check("the refiling can be undone as well",
+      (root / "Personal/Attachments/undo me.jpg").exists(), False)
+bot.handle(text(98, "/undo"))
+check("but the same filing cannot be undone twice",
+      "Nothing to undo" in sent[-1][0], True)
+bot.handle(text(99, "/cancel"))
+check("cancel clears what undo put back",
+      (bot.chat_state(CHAT)["queue"], list(chute.STAGING.iterdir())), ([], []))
+
+section("undo a note")
+bot.handle(text(100, "https://example.com/undo-note"))
+bot.handle(tap(101, "b:work"))
+bot.handle(text(102, "note undo"))
+note = root / "Work/Inbox/note undo.md"
+check("note written", note.exists(), True)
+bot.handle(text(103, "/undo"))
+check("note removed again", note.exists(), False)
+bot.handle(tap(104, "b:work"))
+bot.handle(text(105, "note undo"))
+check("the same note can be filed again", note.exists(), True)
+check("the link survived the round trip",
+      "example.com/undo-note" in note.read_text(), True)
+
+section("undo keeps its hands off a changed file")
+bot.handle(photo(110, caption="edited later"))
+bot.handle(tap(111, "b:work"))
+bot.handle(text(112, "-"))
+edited = root / "Work/Attachments/edited later.jpg"
+edited.write_bytes(b"SOMEONE ELSE CHANGED THIS")
+bot.handle(text(113, "/undo"))
+check("an edited file is left where it is", edited.exists(), True)
+check("and the reason is given", "changed since I filed it" in sent[-1][0], True)
+
+bot.handle(photo(114, caption="moved later"))
+bot.handle(tap(115, "b:work"))
+bot.handle(text(116, "-"))
+moved = root / "Work/Attachments/moved later.jpg"
+moved.rename(root / "Work/moved by hand.jpg")
+bot.handle(text(117, "/undo"))
+check("a file that walked off is not chased",
+      (root / "Work/moved by hand.jpg").exists(), True)
+check("and that is said plainly", "not where I left it" in sent[-1][0], True)
+
+section("undo survives a restart")
+bot.handle(photo(120, caption="restart undo"))
+bot.handle(tap(121, "b:work"))
+bot.handle(text(122, "-"))
+bot.persist()
+after = chute.Bot(make_config(root))
+after.handle(text(123, "/undo"))
+check("the new process can still undo it",
+      (root / "Work/Attachments/restart undo.jpg").exists(), False)
+after.handle(text(124, "/cancel"))
 
 shutil.rmtree(root.parent, ignore_errors=True)
 sys.exit(report())

@@ -44,6 +44,13 @@ characters, which can otherwise make `photo‮gpj.exe` render as
 `photo‮exe.jpg` in a file browser and hide the real extension. Ordinary
 right-to-left text is untouched. Windows device names get a trailing underscore.
 
+**Undo is the only thing that removes a file.** `↩️ Undo` and `/undo` act on the
+last item filed in that chat, and only while it still matches the size and
+modification time Chute recorded when it wrote it. A file that has been edited,
+moved or renamed since is reported and left where it is. Nothing else in Chute
+deletes from your tree; a discarded item is removed from staging, not from the
+root.
+
 **Existing files are never overwritten.** A name that is already taken gets a
 numeric suffix.
 
