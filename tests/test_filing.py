@@ -97,13 +97,16 @@ raises("dot-folder destination rejected",
 
 cfg = make_config(root)
 check("keys derived from labels", [d.key for d in cfg.destinations],
-      ["work", "personal"])
-dupes = make_config(root, destinations=[{"label": "📡 Work", "path": "A"},
-                                        {"label": "🛠 Work", "path": "B"}])
+      ["inbox", "work", "personal"])
+dupes = make_config(root, destinations=[
+    {"label": "📥 Inbox", "path": "Inbox", "catch_all": True},
+    {"label": "📡 Work", "path": "A"},
+    {"label": "🛠 Work", "path": "B"}])
 check("duplicate labels get unique keys", [d.key for d in dupes.destinations],
-      ["work", "work-2"])
+      ["inbox", "work", "work-2"])
 check("explicit key honoured",
-      make_config(root, destinations=[{"label": "X", "path": "X", "key": "kk"}]
+      make_config(root, destinations=[
+          {"label": "X", "path": "X", "key": "kk", "catch_all": True}]
                   ).destinations[0].key, "kk")
 check("blocked extensions defaulted", ".app" in cfg.blocked_ext, True)
 check("max size clamped to telegram ceiling",
@@ -113,8 +116,45 @@ warn = make_config(root, destinations=[{"label": "D%d" % i, "path": "D%d" % i}
                                        for i in range(14)]).validate_paths()
 check("warns past 12 destinations", any("unwieldy" in w for w in warn), True)
 
+section("the landing folder")
+flagged = make_config(root, destinations=[
+    {"label": "A", "path": "A"},
+    {"label": "B", "path": "B", "catch_all": True}])
+check("an explicit flag wins", flagged.inbox.key, "b")
+check("and is not treated as derived", flagged.inbox_derived, False)
+check("nothing is prepended", len(flagged.destinations), 2)
+
+raises("two landing folders are refused", lambda: make_config(root, destinations=[
+    {"label": "A", "path": "A", "catch_all": True},
+    {"label": "B", "path": "B", "catch_all": True}]), chute.ConfigError)
+
+named = make_config(root, destinations=[{"label": "Inbox", "path": "In"},
+                                        {"label": "Work", "path": "Work"}])
+check("a button already called Inbox is adopted", named.inbox.key, "inbox")
+check("adopting one counts as derived", named.inbox_derived, True)
+check("an adopted button is not duplicated", len(named.destinations), 2)
+
+bare = make_config(root, destinations=[{"label": "Work", "path": "Work"}])
+check("with none, one is invented", bare.inbox.path, "Inbox")
+check("invented one is flagged derived", bare.inbox_derived, True)
+check("and gets a button, first in the row",
+      [d.key for d in bare.destinations], ["inbox", "work"])
+check("deriving warns so it is not silent",
+      any("no landing folder is set" in w for w in bare.validate_paths()), True)
+
+by_kind_inbox = make_config(root, destinations=[
+    {"label": "In", "path": "In", "catch_all": True,
+     "by_kind": {"text": "In/Notes"}}])
+check("the landing folder routes by kind too",
+      by_kind_inbox.resolve_dir(by_kind_inbox.inbox, "text", ".md"),
+      root / "In/Notes")
+
+raises("an escaping landing path is caught", lambda: make_config(
+    root, destinations=[{"label": "Bad", "path": "../out", "catch_all": True}]
+).validate_paths(), chute.ConfigError)
+
 section("routing")
-work, personal = cfg.destinations
+inbox, work, personal = cfg.destinations
 check("image uses default path", cfg.resolve_dir(work, "image", ".jpg"),
       root / "Work/Attachments")
 check("document uses default path", cfg.resolve_dir(work, "document", ".pdf"),
@@ -127,7 +167,7 @@ check("destination without by_kind falls through",
       cfg.resolve_dir(personal, "media", ".ogg"), root / "Personal/Attachments")
 dated = make_config(root, destinations=[{"label": "Log", "path": "Log/{year}"}])
 check("template resolved at file time",
-      str(dated.resolve_dir(dated.destinations[0], "image", ".jpg")).endswith(
+      str(dated.resolve_dir(dated.by_key["log"], "image", ".jpg")).endswith(
           "Log/%s" % chute.datetime.now().strftime("%Y")), True)
 
 section("writing files")

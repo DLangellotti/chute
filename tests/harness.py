@@ -43,6 +43,7 @@ def make_config(root, **overrides):
         "allowed_user_ids": [555],
         "root": str(root),
         "destinations": [
+            {"label": "📥 Inbox", "path": "Inbox", "catch_all": True},
             {"label": "📡 Work", "path": "Work/Attachments",
              "by_kind": {"media": "Media/Work", "text": "Work/Inbox"}},
             {"label": "🏠 Personal", "path": "Personal/Attachments"},

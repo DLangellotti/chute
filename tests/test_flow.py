@@ -91,8 +91,10 @@ section("keyboard is built from config")
 bot.handle(photo(1, caption="q3 pricing table"))
 keys = [b["callback_data"] for row in sent[-1][1] for b in row]
 labels = [b["text"] for row in sent[-1][1] for b in row]
-check("one button per destination", keys[:2], ["b:work", "b:personal"])
-check("labels come from config", labels[:2], ["📡 Work", "🏠 Personal"])
+check("one button per destination", keys[:3],
+      ["b:inbox", "b:work", "b:personal"])
+check("labels come from config", labels[:3],
+      ["📥 Inbox", "📡 Work", "🏠 Personal"])
 check("only discard appended", keys[-1], "b:__cancel")
 check("no custom-path button", "b:__custom" in keys, False)
 check("no repeat button either", any(k.startswith("q:") for k in keys), False)

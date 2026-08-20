@@ -231,6 +231,32 @@ def ext_of(filename, default=""):
 
 # ---------------------------------------------------------------- config
 
+DERIVED_INBOX = {"label": "📥 Inbox", "path": "Inbox", "catch_all": True}
+
+
+def resolve_inbox(destinations, taken_keys):
+    """The folder everything lands in. Returns (Destination, was_derived).
+
+    An explicit catch_all wins. Failing that a button already called Inbox is
+    used, since that is plainly what its owner meant it for. Failing that one
+    is invented, so a config written before this existed keeps working and its
+    files land somewhere new and obvious rather than mixed into a folder that
+    already means something.
+    """
+    flagged = [d for d in destinations if d.catch_all]
+    if len(flagged) > 1:
+        raise ConfigError(
+            'only one folder can be the landing folder, but %d have '
+            '"catch_all": true: %s'
+            % (len(flagged), ", ".join(d.label for d in flagged)))
+    if flagged:
+        return flagged[0], False
+    for dest in destinations:
+        if dest.key == "inbox":
+            return dest, True
+    return Destination(DERIVED_INBOX, -1, taken_keys), True
+
+
 class Destination:
     def __init__(self, raw, index, taken_keys):
         if not isinstance(raw, dict):
@@ -257,6 +283,9 @@ class Destination:
             n += 1
         taken_keys.add(key)
         self.key = key
+        # The folder everything lands in on arrival. Exactly one destination
+        # carries this; it still gets a button, so a file can be moved back.
+        self.catch_all = bool(raw.get("catch_all"))
 
     def template_for(self, kind):
         return self.by_kind.get(kind, self.path)
@@ -291,6 +320,9 @@ class Config:
             raise ConfigError("destinations is empty. Add at least one folder.")
         taken = set()
         self.destinations = [Destination(d, i, taken) for i, d in enumerate(dests)]
+        self.inbox, self.inbox_derived = resolve_inbox(self.destinations, taken)
+        if self.inbox_derived and self.inbox not in self.destinations:
+            self.destinations.insert(0, self.inbox)
         self.by_key = {d.key: d for d in self.destinations}
 
         self.naming = data.get("naming") or {}
@@ -333,6 +365,23 @@ class Config:
             if len(dest.label) > 30:
                 warnings.append("label %r is long and will wrap on a phone"
                                 % dest.label)
+        # Everything is written here before anyone taps anything, so a landing
+        # folder that cannot be written to is a total failure, not a per-file one.
+        landing = self.resolve_dir(self.inbox, "image", ".jpg")
+        probe = landing if landing.is_dir() else landing.parent
+        while not probe.exists() and probe != probe.parent:
+            probe = probe.parent
+        if not os.access(str(probe), os.W_OK):
+            raise ConfigError("the landing folder %s is not writable" % landing)
+        if is_template(self.inbox.path):
+            warnings.append(
+                "the landing folder path %r changes with the date, so unfinished "
+                "downloads can only be tidied from today's folder"
+                % self.inbox.path)
+        if self.inbox_derived:
+            warnings.append(
+                "no landing folder is set, so things will arrive in %s. "
+                "Choose one with: %s config" % (self.inbox.path, cli_name()))
         return warnings
 
     def resolve_dir(self, dest, kind, ext):
