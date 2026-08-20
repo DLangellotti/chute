@@ -76,8 +76,8 @@ FIRST RUN
                Linux). Runs check first and refuses to install a broken config.
 
 DAY TO DAY
-  config       Change anything: folders, naming, who may use the bot.
-               A menu, not a text editor. Run chute restart afterwards.
+  config       Folders and buttons, where files go, who may use the bot,
+               and the token. A menu, not a text editor. Restart afterwards.
   status       Is it running? (default when no command is given)
   log          Follow the log. Ctrl-C to stop watching.
   restart      Pick up changes made with config, or edits to chute.py.
@@ -99,9 +99,11 @@ OPTIONS
                   ${XDG_CONFIG_HOME:-~/.config}/chute/config.json
 
 IN TELEGRAM
-  /status      What is pending
-  /cancel      Drop everything pending
-  /help        The folders you configured, and how naming works
+  /history     What was filed where, and when
+  /help        Your folders, how names are made, and the limits
+
+  Everything you send is filed on arrival. The buttons on each reply move
+  that file to another folder, or delete it.
 
 Docs: README.md    Threat model: SECURITY.md
 CHUTE_HELP

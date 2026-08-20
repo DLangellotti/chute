@@ -4,6 +4,11 @@
   "root": "~/Downloads",
   "destinations": [
     {
+      "label": "📥 Inbox",
+      "path": "Inbox",
+      "catch_all": true
+    },
+    {
       "label": "🧾 Receipts",
       "path": "Receipts"
     },

@@ -1,10 +1,22 @@
 {
   "bot_token": "PUT-YOUR-BOTFATHER-TOKEN-HERE",
-  "allowed_user_ids": [123456789],
+  "allowed_user_ids": [
+    123456789
+  ],
   "root": "~/Notes",
   "destinations": [
-    { "label": "📥 Inbox", "path": "Inbox" },
-    { "label": "🧾 Receipts", "path": "Admin/Receipts" },
-    { "label": "📸 Screenshots", "path": "Screenshots" }
+    {
+      "label": "📥 Inbox",
+      "path": "Inbox",
+      "catch_all": true
+    },
+    {
+      "label": "🧾 Receipts",
+      "path": "Admin/Receipts"
+    },
+    {
+      "label": "📸 Screenshots",
+      "path": "Screenshots"
+    }
   ]
 }

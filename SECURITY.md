@@ -20,6 +20,18 @@ messages sent to that bot and send messages as it. If a token leaks, run
 plain text. Do not commit it. The shipped `.gitignore` already excludes it, along
 with `state.json`, the staging folder and the log.
 
+## Files are written before anyone approves them
+
+This is the change most worth understanding. Chute writes what it receives into
+your Inbox folder the moment it arrives; the buttons on the reply move a file
+that already exists. Nothing waits for a human.
+
+So an id wrongly present in `allowed_user_ids` no longer merely gets to *ask*
+for a file to be filed. Everything it sends lands in your Inbox unattended,
+bounded only by the extension blocklist, the 20 MB cap and root containment
+below. Keep that list to accounts you control, and treat the Inbox as the one
+folder a mistake can fill.
+
 ## What is enforced
 
 **Paths cannot escape the root.** Every destination path from the config is
@@ -43,12 +55,15 @@ characters, which can otherwise make `photo‮gpj.exe` render as
 `photo‮exe.jpg` in a file browser and hide the real extension. Ordinary
 right-to-left text is untouched. Windows device names get a trailing underscore.
 
-**Undo is the only thing that removes a file.** `↩️ Undo` and `/undo` act on the
-last item filed in that chat, and only while it still matches the size and
-modification time Chute recorded when it wrote it. A file that has been edited,
-moved or renamed since is reported and left where it is. Nothing else in Chute
-deletes from your tree; a discarded item is removed from staging, not from the
-root.
+**Delete is the only thing that removes a file, and it is strict.** 🗑 unlinks
+a file only while it is exactly the one Chute wrote: same path, same size, same
+modification time. Edit it, move it or rename it and the tap is refused with the
+reason. Nothing else in Chute deletes from your tree.
+
+**Moving is deliberately more permissive than deleting.** A tap on a folder
+button moves a file whose bytes have changed since Chute wrote it, because
+cropping a photo in place should not strip its message of every button forever.
+It still refuses to chase a file that has been moved or renamed by hand.
 
 **Existing files are never overwritten.** A name that is already taken gets a
 numeric suffix.

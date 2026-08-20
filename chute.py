@@ -4,9 +4,9 @@ Chute - send a file to a Telegram bot, it lands in the right folder.
 
 Point it at any folder tree: an Obsidian vault, a Logseq graph, a NAS share, a
 plain Downloads folder. Send the bot anything Telegram carries: photos, any
-file, audio, video, links, forwarded text. Tap a folder button and it is
-written to that folder, named by date and type, or by your caption. Polling
-only, so it works behind NAT with no public URL.
+file, audio, video, links, forwarded text. It lands in your Inbox folder as it
+arrives, named by date and type or by your caption, and the buttons on the
+reply move it. Polling only, so it works behind NAT with no public URL.
 
     chute.py setup     one-time: bot token, root folder, destinations
     chute.py run       long-poll Telegram and file what arrives
@@ -30,7 +30,7 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 APP = "chute"
 
 HERE = Path(__file__).resolve().parent
@@ -1885,11 +1885,14 @@ def cmd_setup(args):
     print("    %s config     change folders, buttons, anything" % cli)
     print("\nOnce it is running, filing works like this:")
     print("\n    1. Send the bot anything: a photo, a file, audio, video,")
-    print("       or a link.")
-    print("    2. Tap a folder button. It is saved there at once.")
+    print("       or a link. It is saved to your Inbox straight away.")
+    print("    2. Tap a folder on the reply to move it there. Tap another")
+    print("       to move it again, or 🗑 to delete it.")
     print("\nNames are date plus type, like '2026-08-20 1848 Image.jpg'.")
-    print("A caption becomes the filename instead. Wrong folder? /undo in")
-    print("the chat takes the last filed item back. /help repeats this.")
+    print("A caption becomes the filename instead.")
+    print("\nChute only runs while this computer is awake. Send things any")
+    print("time: Telegram holds them for 24 hours and Chute files them when")
+    print("the computer wakes. /help in the chat repeats all of this.")
     print("\nRun %s install now, then send your bot a photo to try it out."
           % cli)
     return 0

@@ -3,9 +3,26 @@
   "allowed_user_ids": [],
   "root": "~/Archive",
   "destinations": [
-    { "label": "📷 Camera", "path": "Photos/{year}/{month}" },
-    { "label": "🎙 Voice", "path": "Audio/{year}" },
-    { "label": "📥 Everything else", "path": "Inbox/{date}" }
+    {
+      "label": "📥 Inbox",
+      "path": "Inbox",
+      "catch_all": true
+    },
+    {
+      "label": "📷 Camera",
+      "path": "Photos/{year}/{month}"
+    },
+    {
+      "label": "🎙 Voice",
+      "path": "Audio/{year}"
+    },
+    {
+      "label": "📥 Everything else",
+      "path": "Inbox/{date}"
+    }
   ],
-  "naming": { "style": "snake", "lowercase": true }
+  "naming": {
+    "style": "snake",
+    "lowercase": true
+  }
 }
