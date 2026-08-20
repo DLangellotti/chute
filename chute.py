@@ -1185,150 +1185,6 @@ def is_template(path):
     return "{" in str(path)
 
 
-def _join_rel(here, name):
-    return "%s/%s" % (here, name) if here else name
-
-
-def browse_folder(root, start="", purpose="these files"):
-    """Pick a folder under root. Returns a path relative to root.
-
-    Navigation is numbers, every action is a letter, and every action that
-    picks a folder ends the browse. Creating a folder selects it, because
-    that is why you were creating it.
-    """
-    here = "" if is_template(start) else str(start or "").strip("/")
-    if here and not (root / here).is_dir():
-        here = ""
-
-    while True:
-        current = safe_join(root, here) if here else root
-        label = here or "the root folder"
-        subs = []
-        if current.is_dir():
-            subs = sorted(p.name for p in current.iterdir()
-                          if p.is_dir() and not p.name.startswith("."))
-
-        print("\n  Where should %s go?" % purpose)
-        print("  Now in: %s" % label)
-        print("  " + "-" * 46)
-        for i, name in enumerate(subs, 1):
-            print("    %2d. %s" % (i, name))
-        if not subs:
-            print("    (no folders in here yet)")
-        print()
-        if subs:
-            print("    %-6s open that folder" % ("1-%d" % len(subs)))
-        print("    %-6s use this one: %s" % ("s", label))
-        print("    %-6s create a new folder in here" % "c")
-        print("    %-6s type a path instead" % "t")
-        if here:
-            print("    %-6s go up" % "u")
-
-        answer = input("\n  > ").strip()
-        low = answer.lower()
-
-        if low == "s":
-            return here
-
-        if low == "u":
-            if not here:
-                print("  Already at the top.")
-                continue
-            parent = str(Path(here).parent)
-            here = "" if parent == "." else parent
-            continue
-
-        if low == "c":
-            name = input("  Name for the new folder "
-                         "(use / to nest, e.g. Receipts/2026): ").strip()
-            if not name:
-                print("  No name given, nothing created.")
-                continue
-            try:
-                target = safe_join(root, _join_rel(here, name.strip("/")))
-                target.mkdir(parents=True, exist_ok=True)
-            except (ValueError, OSError) as exc:
-                print("  Could not create it: %s" % exc)
-                continue
-            rel = str(target.relative_to(root))
-            print("  Created %s, and that is where these will go." % rel)
-            return rel
-
-        if low == "t":
-            typed = input("  Path under the root: ").strip().lstrip("/")
-            if not typed:
-                continue
-            if is_template(typed):
-                try:
-                    safe_join(root, render_path(typed))
-                except (ValueError, ConfigError) as exc:
-                    print("  That path will not work: %s" % exc)
-                    continue
-                print("  Using %s, expanded when each file is written." % typed)
-                return typed
-            try:
-                target = safe_join(root, typed)
-            except ValueError as exc:
-                print("  That path will not work: %s" % exc)
-                continue
-            if not target.exists():
-                if not ask_bool("  %s does not exist yet. Create it?" % typed,
-                                True):
-                    continue
-                try:
-                    target.mkdir(parents=True, exist_ok=True)
-                except OSError as exc:
-                    print("  Could not create it: %s" % exc)
-                    continue
-                print("  Created %s." % typed)
-            elif not target.is_dir():
-                print("  %s is a file, not a folder." % typed)
-                continue
-            return str(target.relative_to(root))
-
-        if answer.isdigit():
-            n = int(answer)
-            if 1 <= n <= len(subs):
-                here = _join_rel(here, subs[n - 1])
-                continue
-            print("  There is no %d in that list." % n)
-            continue
-
-        print("  Type a number, or s, c, t%s." % (", u" if here else ""))
-
-
-def edit_destination(root, existing=None):
-    """Build or change one button. Returns a destination dict, or None."""
-    existing = existing or {}
-    print("\n  " + ("Editing a folder button" if existing else "New folder button"))
-    label = ask("  What should the button say", existing.get("label", ""))
-    if not label:
-        print("  No label, nothing added.")
-        return None
-
-    dest = {"label": label}
-    dest["path"] = browse_folder(root, existing.get("path", ""),
-                                 "images and documents")
-
-    by_kind = dict(existing.get("by_kind") or {})
-    print("\n  By default everything from this button goes to %s." % dest["path"])
-    if ask_bool("  Send voice notes, audio and video somewhere else instead?",
-                "media" in by_kind):
-        by_kind["media"] = browse_folder(root, by_kind.get("media", ""),
-                                         "audio and video")
-    else:
-        by_kind.pop("media", None)
-    if ask_bool("  Send links and forwarded text somewhere else instead?",
-                "text" in by_kind):
-        by_kind["text"] = browse_folder(root, by_kind.get("text", ""),
-                                        "links and notes")
-    else:
-        by_kind.pop("text", None)
-    if by_kind:
-        dest["by_kind"] = by_kind
-    return dest
-
-
 def show_destinations(dests, root):
     print("\n  Buttons, in the order they appear in Telegram:\n")
     if not dests:
@@ -1340,53 +1196,6 @@ def show_destinations(dests, root):
             nice = {"media": "audio and video", "text": "links and notes",
                     "image": "images", "document": "documents"}[kind]
             print("        %-18s -> %s" % (nice, path))
-
-
-def edit_destinations(root, destinations):
-    dests = [dict(d) for d in destinations]
-    while True:
-        show_destinations(dests, root)
-        if len(dests) > 12:
-            print("\n  Note: more than 12 buttons gets unwieldy on a phone.")
-        print()
-        choice = ask_menu([
-            ("a", "add a button"),
-            ("e", "edit one"),
-            ("r", "remove one"),
-            ("m", "move one up or down"),
-            ("d", "done"),
-        ], default="d" if dests else "a")
-
-        if choice == "a":
-            made = edit_destination(root)
-            if made:
-                dests.append(made)
-        elif choice in ("e", "r", "m") and not dests:
-            print("  Nothing to work with yet. Add one first.")
-        elif choice == "e":
-            n = ask("  Which number")
-            if n.isdigit() and 1 <= int(n) <= len(dests):
-                made = edit_destination(root, dests[int(n) - 1])
-                if made:
-                    dests[int(n) - 1] = made
-        elif choice == "r":
-            n = ask("  Which number")
-            if n.isdigit() and 1 <= int(n) <= len(dests):
-                gone = dests.pop(int(n) - 1)
-                print("  Removed %s. The folder on disk is untouched."
-                      % gone["label"])
-        elif choice == "m":
-            n = ask("  Which number")
-            if n.isdigit() and 1 <= int(n) <= len(dests):
-                i = int(n) - 1
-                where = ask("  Move it to which position (1 is first)")
-                if where.isdigit() and 1 <= int(where) <= len(dests):
-                    dests.insert(int(where) - 1, dests.pop(i))
-        elif choice == "d":
-            if not dests:
-                print("  You need at least one button.")
-                continue
-            return dests
 
 
 # ---------------------------------------------------------------- commands
@@ -1631,12 +1440,30 @@ def pick_starter_buttons(root):
     return toggle_list(STARTER_BUTTONS, allow_new=True)
 
 
+def ensure_inbox(destinations, root):
+    """Guarantee somewhere for things to land, and mark it.
+
+    A button already called Inbox is used as-is. Otherwise one is added at the
+    front, because every arrival needs a folder before anyone taps anything.
+    """
+    for dest in destinations:
+        if slugify(dest["label"]) == "inbox":
+            dest["catch_all"] = True
+            return destinations
+    for dest in destinations:
+        dest.pop("catch_all", None)
+    try:
+        safe_join(root, DERIVED_INBOX["path"]).mkdir(parents=True,
+                                                     exist_ok=True)
+    except (ValueError, OSError) as exc:
+        print("  Could not create the Inbox folder: %s" % exc)
+    return [dict(DERIVED_INBOX)] + destinations
+
+
 def setup_destinations(root):
     """First-run buttons: type a name, get a folder of that name. Nothing else.
 
-    Deliberately simpler than edit_destinations. Setup is the wrong moment to
-    browse a folder tree; anyone who wants sub-paths or per-kind routing can
-    run chute config afterwards.
+    A slash makes a sub-path. Per-kind routing is config.json only.
 
     Returns the list of destinations, or None if the user asked to go back and
     choose a different root folder.
@@ -1716,16 +1543,29 @@ def setup_destinations(root):
         if any(d["label"].lower() == label.lower() for d in dests):
             print("  There is already a button called %s." % label)
             continue
-        if "/" in label or "\\" in label:
-            print("  One name per button, and no slashes. Sub-folders and "
-                  "per-kind routing come later with:  chute config")
-            continue
         # clean_name falls back to a date stamp when nothing usable is left,
         # which would be a baffling folder to end up with. Catch that here.
-        if not ILLEGAL.sub("", label).strip().strip(". "):
+        if not ILLEGAL.sub("", label.replace("/", "")).strip().strip(". "):
             print("  There is nothing in that name I can make a folder from.")
             continue
-        folder = clean_name(label)
+        # A slash makes a sub-path: "Work/Attachments" files into that folder
+        # and puts "Attachments" on the button, since the full path would not
+        # fit one.
+        raw_parts = [part.strip() for part in
+                     label.replace("\\", "/").split("/") if part.strip()]
+        # clean_name would turn ".." into a date stamp, quietly inventing a
+        # folder instead of refusing to climb out of the root.
+        if any(part in (".", "..") for part in raw_parts):
+            print("  A folder cannot step outside your root.")
+            continue
+        parts = [clean_name(part) for part in raw_parts]
+        folder = "/".join(parts)
+        if len(parts) > 1:
+            label = parts[-1]
+            if any(d["label"].lower() == label.lower() for d in dests):
+                print("  There is already a button called %s. Rename it or "
+                      "pick another folder." % label)
+                continue
         try:
             target = safe_join(root, folder)
         except ValueError as exc:
@@ -1751,6 +1591,18 @@ def setup_destinations(root):
     return dests
 
 
+def landing_label(data):
+    """Which folder a config would land things in, without building a Config."""
+    dests = data.get("destinations") or []
+    for dest in dests:
+        if dest.get("catch_all"):
+            return dest.get("path") or dest.get("label")
+    for dest in dests:
+        if slugify(dest.get("label") or "") == "inbox":
+            return dest.get("path") or dest.get("label")
+    return DERIVED_INBOX["path"]
+
+
 def cmd_config(args):
     """Edit an existing config without opening a text editor."""
     path = find_config(args.config)
@@ -1774,41 +1626,36 @@ def cmd_config(args):
     root = root.resolve()
 
     while True:
-        naming = data.get("naming") or {}
-        sec = data.get("security") or {}
-        cap = data.get("text_capture") or {}
         print("\n" + "=" * 62)
         print("Chute configuration            %s" % path)
         print("=" * 62)
         print("  Root folder    %s" % root)
         print("  Buttons        %d" % len(data.get("destinations") or []))
-        print("  Naming         %s%s%s"
-              % (naming.get("style", "keep-spaces"),
-                 ", lowercase" if naming.get("lowercase") else "",
-                 ""))
-        print("  Notes saved as %s%s"
-              % (cap.get("format", "markdown"),
-                 " with frontmatter" if cap.get("frontmatter", True) else ""))
-        print("  Reply to strangers  %s"
-              % ("yes" if sec.get("reply_to_strangers") else "no, stay silent"))
+        print("  Things land in %s" % landing_label(data))
         print("  Allowed Telegram ids   %s"
               % ", ".join(str(i) for i in data.get("allowed_user_ids") or []))
         print()
         choice = ask_menu([
             ("1", "folders and buttons"),
-            ("2", "root folder"),
-            ("3", "how files are named"),
-            ("4", "how links and notes are saved"),
-            ("5", "who may use the bot"),
-            ("6", "privacy and safety"),
-            ("7", "bot token"),
+            ("2", "where files go on this computer"),
+            ("3", "who may use the bot"),
+            ("4", "bot token"),
             ("s", "save and exit"),
             ("q", "quit without saving"),
         ], default="s")
 
         if choice == "1":
-            data["destinations"] = edit_destinations(
-                root, data.get("destinations") or [])
+            print("\n  This rebuilds your buttons. Folders you keep hold on to "
+                  "any\n  per-type routing set in config.json.")
+            rebuilt = setup_destinations(root)
+            if rebuilt is not None:
+                old = {d.get("path"): d for d in data.get("destinations") or []}
+                for dest in rebuilt:
+                    kept = old.get(dest["path"]) or {}
+                    for extra in ("by_kind", "key"):
+                        if extra in kept:
+                            dest[extra] = kept[extra]
+                data["destinations"] = ensure_inbox(rebuilt, root)
         elif choice == "2":
             new_root = prompt_root()
             if new_root:
@@ -1817,29 +1664,6 @@ def cmd_config(args):
                 print("  Buttons still point at the same relative paths. "
                       "Check them with option 1.")
         elif choice == "3":
-            print("\n  Spaces in names are kept as-is by default.")
-            style = ask_menu([("1", "keep spaces  (My Photo.jpg)"),
-                              ("2", "hyphens      (My-Photo.jpg)"),
-                              ("3", "underscores  (My_Photo.jpg)")],
-                             default={"keep-spaces": "1", "kebab": "2",
-                                      "snake": "3"}[naming.get("style",
-                                                               "keep-spaces")])
-            naming["style"] = {"1": "keep-spaces", "2": "kebab",
-                               "3": "snake"}[style]
-            naming["lowercase"] = ask_bool("  Force names to lowercase?",
-                                           bool(naming.get("lowercase")))
-            data["naming"] = naming
-        elif choice == "4":
-            fmt = ask_menu([("1", "Markdown .md, good for Obsidian and Logseq"),
-                            ("2", "plain text .txt")],
-                           default="2" if cap.get("format") == "txt" else "1")
-            cap["format"] = "txt" if fmt == "2" else "markdown"
-            if cap["format"] == "markdown":
-                cap["frontmatter"] = ask_bool(
-                    "  Add YAML frontmatter with the date and source?",
-                    bool(cap.get("frontmatter", True)))
-            data["text_capture"] = cap
-        elif choice == "5":
             ids = list(data.get("allowed_user_ids") or [])
             print("\n  Only these Telegram user ids may use the bot: %s"
                   % ", ".join(str(i) for i in ids))
@@ -1861,12 +1685,7 @@ def cmd_config(args):
                     else:
                         ids.remove(int(gone))
             data["allowed_user_ids"] = ids
-        elif choice == "6":
-            sec["reply_to_strangers"] = ask_bool(
-                "  Reply 'Not authorised' to strangers? Silence is safer",
-                bool(sec.get("reply_to_strangers")))
-            data["security"] = sec
-        elif choice == "7":
+        elif choice == "4":
             tok = str(data.get("bot_token") or "")
             print("\n  Current token ends in ...%s" % tok[-6:] if tok
                   else "\n  No token stored.")
@@ -2009,6 +1828,10 @@ def cmd_setup(args):
         print("You can change all of this later with:  chute config")
         print("-" * 62)
         destinations = setup_destinations(root)
+        if destinations is not None:
+            destinations = ensure_inbox(destinations, root)
+            print("\n  Everything you send lands in %s first. The buttons "
+                  "move it\n  from there." % DERIVED_INBOX["path"])
 
     print("\nLast step: Chute needs to know which Telegram account is yours,")
     print("so that nobody else can ever use this bot.")

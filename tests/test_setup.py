@@ -104,73 +104,6 @@ with Script([""]) as s:
     chute.prompt_root()
     check("prompt mentions the choice", "Choice" in s.asked[0], True)
 
-section("browsing for a folder")
-br = tmp / "Tree"
-(br / "Work" / "Attachments").mkdir(parents=True)
-(br / "Personal").mkdir()
-
-with Script(["s"]):
-    check("s at the root selects the root", chute.browse_folder(br), "")
-with Script(["2", "s"]):
-    check("number opens, s selects it", chute.browse_folder(br), "Work")
-with Script(["2", "1", "s"]):
-    check("descends two levels", chute.browse_folder(br), "Work/Attachments")
-with Script(["2", "1", "u", "s"]):
-    check("u goes back up", chute.browse_folder(br), "Work")
-with Script(["u", "s"]):
-    check("u at the root is refused, not a crash", chute.browse_folder(br), "")
-with Script(["9", "s"]):
-    check("out of range number is refused", chute.browse_folder(br), "")
-
-section("creating a folder selects it")
-with Script(["c", "Receipts"]):
-    check("c creates and selects in one step", chute.browse_folder(br), "Receipts")
-check("it exists on disk", (br / "Receipts").is_dir(), True)
-# Its own tree: earlier checks add folders to br and shift the numbering.
-solo = tmp / "Solo"
-(solo / "Work").mkdir(parents=True)
-with Script(["1", "c", "Invoices"]):
-    check("creates inside where you are", chute.browse_folder(solo),
-          "Work/Invoices")
-check("created in the right parent", (solo / "Work" / "Invoices").is_dir(), True)
-with Script(["c", "A/B/C"]):
-    check("slashes nest", chute.browse_folder(br), "A/B/C")
-check("nested folders really made", (br / "A" / "B" / "C").is_dir(), True)
-with Script(["c", "", "s"]):
-    check("empty name creates nothing, back to menu", chute.browse_folder(br), "")
-
-section("typing a path selects it, never wanders into it")
-with Script(["t", "Work/Attachments"]):
-    check("existing path selected outright",
-          chute.browse_folder(br), "Work/Attachments")
-with Script(["t", "Brand New", "y"]):
-    check("missing path is created then selected",
-          chute.browse_folder(br), "Brand New")
-check("and it exists", (br / "Brand New").is_dir(), True)
-with Script(["t", "Declined Path", "n", "s"]):
-    check("declining leaves you at the menu", chute.browse_folder(br), "")
-check("declined path not created", (br / "Declined Path").exists(), False)
-with Script(["t", "../../etc", "s"]):
-    check("traversal refused", chute.browse_folder(br), "")
-with Script(["t", "Photos/{year}/{month}"]):
-    check("template accepted as written",
-          chute.browse_folder(br), "Photos/{year}/{month}")
-check("template not created as a literal folder",
-      (br / "Photos").exists(), False)
-with Script(["t", "{nope}", "s"]):
-    check("bad template token refused", chute.browse_folder(br), "")
-
-section("starting point")
-with Script(["s"]):
-    check("opens where the destination already points",
-          chute.browse_folder(br, start="Work"), "Work")
-with Script(["s"]):
-    check("a stale start falls back to the root",
-          chute.browse_folder(br, start="Deleted/Folder"), "")
-with Script(["s"]):
-    check("a template start falls back to the root",
-          chute.browse_folder(br, start="Photos/{year}"), "")
-
 section("naming the buttons")
 buttons = tmp / "Buttons"
 buttons.mkdir()
@@ -212,10 +145,11 @@ with Script(["d", ".hidden", ""]):
 check("no dot-folder created", (buttons / ".hidden").exists(), False)
 check("plain folder created instead", (buttons / "hidden").is_dir(), True)
 
-with Script(["d", "Talks/2026", "Talks", ""]):
-    check("a slash is refused rather than flattened",
+with Script(["d", "Talks/2026", ""]):
+    check("a slash makes a sub-path, labelled by its last part",
           chute.setup_destinations(buttons),
-          [{"label": "Talks", "path": "Talks"}])
+          [{"label": "2026", "path": "Talks/2026"}])
+check("the nested folder was made", (buttons / "Talks" / "2026").is_dir(), True)
 check("nothing named Talks2026", (buttons / "Talks2026").exists(), False)
 
 with Script(["d", "...", "Plain", ""]):
