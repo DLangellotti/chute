@@ -336,6 +336,70 @@ nofm = chute.file_item({"kind": "text", "text": "no fm"}, root / "Plain", "n2",
                        make_config(root, text_capture={"frontmatter": False}))
 check("frontmatter can be off", nofm.read_text().startswith("---"), False)
 
+section("forwarded media keep their message in a companion note")
+check("a plain photo earns no note",
+      chute.sidecar_worthy({"kind": "image", "caption": "receipt"}), False)
+check("a forward origin earns one",
+      chute.sidecar_worthy({"kind": "image", "meta": {"from": "Amit"}}), True)
+check("a second caption line earns one",
+      chute.sidecar_worthy({"kind": "image", "caption": "title\ndetail"}), True)
+check("a link in the caption earns one",
+      chute.sidecar_worthy({"kind": "image",
+                            "meta": {"links": ["https://a.com"]}}), True)
+
+fwd = {"kind": "image", "staged": staged("f.jpg"), "ext": ".jpg",
+       "caption": "Router teardown\nworth reading in full https://a.com/post",
+       "meta": {"from": "Some Channel", "forwarded": "2026-08-19",
+                "url": "https://t.me/somechan/55",
+                "links": ["https://a.com/post"]}}
+fpath = chute.file_item(fwd, root / "Forwards", chute.name_for(fwd), cfg)
+fnote = Path(fwd["sidecar"])
+fbody = fnote.read_text()
+check("file named by the caption's first line", fpath.name,
+      "Router teardown.jpg")
+check("note sits next to the file, same stem",
+      (fnote.parent, fnote.name), (fpath.parent, "Router teardown.md"))
+check("origin recorded", 'forwarded-from: "Some Channel"' in fbody, True)
+check("forward date recorded", "forwarded-date: 2026-08-19" in fbody, True)
+check("t.me source linked", "Source: https://t.me/somechan/55" in fbody, True)
+check("full caption kept, second line included",
+      "worth reading in full https://a.com/post" in fbody, True)
+check("note names its file", 'file: "Router teardown.jpg"' in fbody, True)
+check("image embedded", "![](<Router teardown.jpg>)" in fbody, True)
+
+frec = {"path": str(fpath), "stem": fpath.stem, "ext": ".jpg",
+        "kind": "image", "dest": "inbox", "size": fpath.stat().st_size,
+        "mtime": int(fpath.stat().st_mtime),
+        "sidecar": chute.sidecar_stat(fnote)}
+fmoved = chute.move_filed(frec, root / "Work", root)
+check("moving the file brings the note",
+      (root / "Work/Router teardown.md").is_file(), True)
+check("and the old note is gone", fnote.exists(), False)
+check("record follows the note",
+      frec["sidecar"]["path"], str(root / "Work/Router teardown.md"))
+
+chute.restat(frec, fmoved, "work")
+chute.delete_filed(frec, root)
+kept = chute.delete_sidecar(frec)
+check("deleting the file deletes an untouched note",
+      (kept, (root / "Work/Router teardown.md").exists()), (None, False))
+
+edited = {"kind": "document", "staged": staged("g.pdf"), "ext": ".pdf",
+          "meta": {"from": "Amit"}, "caption": ""}
+gpath = chute.file_item(edited, root / "Forwards", "briefing", cfg)
+gnote = Path(edited["sidecar"])
+check("non-image gets a link, not an embed",
+      "[briefing.pdf](<briefing.pdf>)" in gnote.read_text(), True)
+grec = {"sidecar": chute.sidecar_stat(gnote)}
+gnote.write_text(gnote.read_text() + "\nmy own thoughts\n")
+check("an edited note survives the delete",
+      (chute.delete_sidecar(grec), gnote.exists()), (gnote, True))
+
+lost = {"sidecar": {"path": str(root / "Forwards/never was.md"),
+                    "size": 1, "mtime": 1}}
+check("a note removed by hand is let go quietly",
+      chute.delete_sidecar(lost), None)
+
 
 
 section("single instance lock")

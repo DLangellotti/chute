@@ -29,6 +29,11 @@ Nothing waits for an answer, so a backlog is already filed by the time you look.
 Files are named `2026-08-20 1848 Image.jpg`. Add a caption and that becomes the
 filename instead.
 
+Forward a photo or file from another chat and nothing is lost: who it came
+from, the source link and the full caption land in a small `.md` note saved
+next to the file. The buttons move and delete the pair together, though a note
+you have edited survives the 🗑.
+
 Chute files only while your computer is awake. Telegram holds what you send for
 24 hours, and Chute collects it on waking.
 

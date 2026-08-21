@@ -4,7 +4,7 @@ Chute - send a file to a Telegram bot, it lands in the right folder.
 
 Point it at any folder tree: an Obsidian vault, a Logseq graph, a NAS share, a
 plain Downloads folder. Send the bot anything Telegram carries: photos, any
-file, audio, video, links, forwarded text. It lands in your Inbox folder as it
+file, audio, video, links, forwarded messages. It lands in your Inbox folder as it
 arrives, named by date and type or by your caption, and the buttons on the
 reply move it. Polling only, so it works behind NAT with no public URL.
 
@@ -30,7 +30,7 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 APP = "chute"
 
 HERE = Path(__file__).resolve().parent
@@ -542,7 +542,7 @@ def forward_meta(msg):
         if origin.get("date"):
             meta["forwarded"] = datetime.fromtimestamp(
                 origin["date"]).strftime("%Y-%m-%d")
-    urls = re.findall(r"https?://\S+", msg.get("text") or "")
+    urls = re.findall(r"https?://\S+", msg.get("text") or msg.get("caption") or "")
     if urls:
         meta["links"] = urls[:10]
     return meta
@@ -553,7 +553,8 @@ def extract_item(msg, tg, staging, cfg):
     caption = (msg.get("caption") or "").strip()
     item = {"id": "%s-%s" % (msg.get("message_id"),
                              int(time.time() * 1000) % 100000),
-            "caption": caption}
+            "caption": caption,
+            "meta": forward_meta(msg)}
 
     file_id = orig_name = None
     default_ext = ""
@@ -588,7 +589,6 @@ def extract_item(msg, tg, staging, cfg):
     elif (msg.get("text") or "").strip():
         item["kind"] = "text"
         item["text"] = msg["text"]
-        item["meta"] = forward_meta(msg)
         return item
     else:
         return None
@@ -686,6 +686,50 @@ def note_body(item, title, opts):
     return "\n".join(lines)
 
 
+def sidecar_worthy(item):
+    """Whether saving just the file would lose part of the message.
+
+    True when the message was forwarded (the origin dies with the Telegram
+    chat), when the caption carries a link (filename cleaning mangles URLs),
+    or when the caption runs past the first line (only that line becomes the
+    filename).
+    """
+    meta = item.get("meta") or {}
+    if meta.get("from") or meta.get("forwarded") or meta.get("url") \
+            or meta.get("links"):
+        return True
+    rest = (item.get("caption") or "").strip().splitlines()[1:]
+    return bool("".join(rest).strip())
+
+
+def sidecar_body(item, filename):
+    """A companion note for a media file: the forward origin and the full
+    caption, written next to the file so the pair travels together."""
+    meta = item.get("meta") or {}
+    lines = ["---",
+             "created: %s" % datetime.now().strftime("%Y-%m-%d"),
+             "source: telegram",
+             "file: %s" % json.dumps(filename, ensure_ascii=False)]
+    if meta.get("from"):
+        lines.append("forwarded-from: %s" % json.dumps(meta["from"],
+                                                       ensure_ascii=False))
+    if meta.get("forwarded"):
+        lines.append("forwarded-date: %s" % meta["forwarded"])
+    lines += ["---", ""]
+    # Angle brackets keep a filename with spaces valid CommonMark, and
+    # Obsidian renders both forms.
+    if item.get("kind") == "image":
+        lines += ["![](<%s>)" % filename, ""]
+    else:
+        lines += ["[%s](<%s>)" % (filename, filename), ""]
+    if meta.get("url"):
+        lines += ["Source: %s" % meta["url"], ""]
+    caption = (item.get("caption") or "").strip()
+    if caption:
+        lines += [caption, ""]
+    return "\n".join(lines)
+
+
 def file_item(item, directory, name, cfg):
     directory.mkdir(parents=True, exist_ok=True)
     stem = clean_name(name, cfg.naming)
@@ -700,6 +744,10 @@ def file_item(item, directory, name, cfg):
             stem = stem[: -len(ext)].rstrip() or stem
         dest = unique_path(directory, stem, ext)
         shutil.move(item["staged"], str(dest))
+        if sidecar_worthy(item):
+            note = unique_path(directory, dest.stem, ".md")
+            note.write_text(sidecar_body(item, dest.name), encoding="utf-8")
+            item["sidecar"] = str(note)
     return dest
 
 
@@ -746,6 +794,53 @@ def verify_filed(record, root, strict=True):
     return path
 
 
+def sidecar_stat(path):
+    """The record entry for a companion note: where it is, what it looks like."""
+    st = Path(path).stat()
+    return {"path": str(path), "size": st.st_size, "mtime": int(st.st_mtime)}
+
+
+def move_sidecar(record, directory, stem):
+    """Bring the companion note along when its file moves. Best effort:
+    a note the user renamed or deleted by hand is simply let go."""
+    sc = record.get("sidecar")
+    if not sc:
+        return
+    note = Path(sc["path"])
+    if not note.is_file():
+        record.pop("sidecar", None)
+        return
+    target = unique_path(directory, stem, note.suffix)
+    try:
+        shutil.move(str(note), str(target))
+        record["sidecar"] = sidecar_stat(target)
+    except OSError:
+        pass
+
+
+def delete_sidecar(record):
+    """Remove the companion note with its file, unless it has been edited.
+
+    An edited note holds the user's own words now, so it survives the 🗑.
+    Returns the surviving path in that case, else None.
+    """
+    sc = record.pop("sidecar", None)
+    if not sc:
+        return None
+    note = Path(sc["path"])
+    try:
+        st = note.stat()
+    except OSError:
+        return None
+    if st.st_size != sc.get("size") or int(st.st_mtime) != sc.get("mtime"):
+        return note
+    try:
+        note.unlink()
+    except OSError:
+        return note
+    return None
+
+
 def move_filed(record, directory, root):
     """Move an already-filed file into directory. Returns its new path.
 
@@ -759,6 +854,7 @@ def move_filed(record, directory, root):
         return src
     dest = unique_path(directory, record.get("stem") or src.stem, src.suffix)
     shutil.move(str(src), str(dest))
+    move_sidecar(record, directory, dest.stem)
     return dest
 
 
@@ -857,7 +953,9 @@ class Bot:
         lines += ["", "Names are date plus type, like <code>2026-08-20 1848 "
                       "Image.jpg</code>. A caption overrides that: caption a "
                       "photo <code>contract p3</code> and that is its "
-                      "filename. Links and text become notes.", "",
+                      "filename. Links and text become notes. A forwarded "
+                      "photo or file keeps who it came from, the source link "
+                      "and its full caption in a note saved next to it.", "",
                   "I only answer while my computer is awake. Send anyway: "
                   "Telegram keeps things for 24 hours and I file them when I "
                   "wake up.", "",
@@ -979,6 +1077,11 @@ class Bot:
 
         record = restat({"stem": path.stem, "ext": path.suffix,
                          "kind": item["kind"]}, path, inbox.key)
+        if item.get("sidecar"):
+            try:
+                record["sidecar"] = sidecar_stat(item["sidecar"])
+            except OSError:
+                pass
         self.note_history(cs, path, item["kind"], "filed")
         log("filed -> %s" % rel_to(self.cfg.root, path))
         sent = self.tg.send(chat_id, self.filed_text(record),
@@ -987,7 +1090,11 @@ class Bot:
 
     def filed_text(self, record, verb="Filed"):
         rel = rel_to(self.cfg.root, record["path"])
-        return "%s\n<code>%s</code>" % (verb, rel)
+        text = "%s\n<code>%s</code>" % (verb, rel)
+        sc = record.get("sidecar")
+        if sc:
+            text += "\n+ <code>%s</code>" % rel_to(self.cfg.root, sc["path"])
+        return text
 
     def note_history(self, cs, path, kind, action):
         history = cs.setdefault("history", [])
@@ -1083,12 +1190,15 @@ class Bot:
         except Exception as exc:
             log("delete failed: %r" % (exc,))
             return self.tg.send(chat_id, "Could not delete that: %s" % exc)
+        kept = delete_sidecar(record)
         self.note_history(cs, path, record["kind"], "deleted")
         log("deleted -> %s" % rel_to(self.cfg.root, path))
         cs["filed"].pop(str(message_id), None)
-        self.confirm(chat_id, cs, message_id, None,
-                     "🗑 Deleted <code>%s</code>"
-                     % rel_to(self.cfg.root, path))
+        text = "🗑 Deleted <code>%s</code>" % rel_to(self.cfg.root, path)
+        if kept:
+            text += ("\nIts note <code>%s</code> has your edits, so it stays."
+                     % rel_to(self.cfg.root, kept))
+        self.confirm(chat_id, cs, message_id, None, text)
 
     def confirm(self, chat_id, cs, message_id, record, text):
         """Update a message in place, or post a fresh one if it is too old.

@@ -5,3 +5,4 @@ state.json.tmp
 staging/
 chute.log
 .DS_Store
+.claude/settings.local.json
