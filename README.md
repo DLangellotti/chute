@@ -44,7 +44,19 @@ carries one more button: 📝 Transcribe. Tap it and the words are added to the
 note that file already has, or a note is made for it. One markdown file per
 thing you send, never two: a link is already a note, so the words go into it,
 and a forwarded recording's note gains a Transcript section under what was
-already there. Move the file later and its note goes with it.
+already there. The note is then named for what it is a transcript of and when
+it was made, like `Root of Trust transcript 2026-08-23 0012.md`.
+
+A YouTube video is kept, not just its words. It lands next to the note under
+the video's own title, and the two move and delete together:
+
+```
+Root of Trust.mp4
+Root of Trust transcript 2026-08-23 0012.md
+```
+
+Reckon on 500 MB to 1 GB for an hour at 1080p. Set `transcription.keep` to
+`audio` for the sound alone, or `none` to keep only the words.
 
 The language is worked out from the recording, so nothing has to be set in
 advance, and it is recorded in the note's frontmatter along with the duration
@@ -97,6 +109,8 @@ Transcription settings, all optional:
 | `timestamps` | `true` writes `[0:04:12]` against each line |
 | `max_minutes` | refuse anything longer. 240 by default |
 | `youtube_captions` | `manual` (default), `any` to accept YouTube's automatic ones, `off` to always transcribe the audio |
+| `keep` | `video` (default), `audio`, or `none`. What is kept from a YouTube link |
+| `max_download_mb` | Refuse a download bigger than this. 2000 by default |
 | `prompt` | The opening line shown to whisper. It writes in the style of what it decodes first and carries that forward, so a recording that opens over music can come out as one unpunctuated lowercase run. The default prompt shows ordinary punctuation and settles it. `""` turns it off |
 | `threads` | passed to whisper.cpp. Its own default otherwise |
 | `whisper_bin`, `ffmpeg_bin`, `ytdlp_bin` | paths, if they are not on `PATH` |

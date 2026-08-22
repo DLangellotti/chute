@@ -336,6 +336,15 @@ nofm = chute.file_item({"kind": "text", "text": "no fm"}, root / "Plain", "n2",
                        make_config(root, text_capture={"frontmatter": False}))
 check("frontmatter can be off", nofm.read_text().startswith("---"), False)
 
+section("a note's heading matches the name it actually got")
+dupdir = root / "Dups"
+first = chute.file_item({"kind": "text", "text": "one"}, dupdir, "Same name", cfg)
+second = chute.file_item({"kind": "text", "text": "two"}, dupdir, "Same name", cfg)
+check("the second file is suffixed", second.name, "Same name 2.md")
+check("and its heading says so", "# Same name 2" in second.read_text(), True)
+check("the first is unchanged", "# Same name\n" in first.read_text(), True)
+
+
 section("forwarded media keep their message in a companion note")
 check("a plain photo earns no note",
       chute.sidecar_worthy({"kind": "image", "caption": "receipt"}), False)

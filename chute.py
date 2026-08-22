@@ -774,7 +774,10 @@ def file_item(item, directory, name, cfg):
         opts = cfg.text_capture
         ext = ".txt" if opts.get("format") == "txt" else ".md"
         dest = unique_path(directory, stem, ext)
-        dest.write_text(note_body(item, stem, opts), encoding="utf-8")
+        # The heading comes from the name the file actually got: a second note
+        # in the same minute lands as "... Note 2" and must not be titled
+        # "... Note".
+        dest.write_text(note_body(item, dest.stem, opts), encoding="utf-8")
     else:
         ext = item.get("ext") or ""
         if ext and stem.lower().endswith(ext.lower()):
@@ -830,6 +833,34 @@ def verify_filed(record, root, strict=True):
         raise NotAsFiled("<code>%s</code> has changed since I filed it, so I "
                          "have left it alone." % shown)
     return path
+
+
+def retitle(text, old, new):
+    """Rewrite a note's top heading when its file is renamed under it.
+
+    Only touches a heading that still says exactly what the file used to be
+    called, so a heading someone wrote themselves is left alone.
+    """
+    if not new or old == new:
+        return text
+    return re.sub(r"(?m)^# %s[ \t]*$" % re.escape(old), "# %s" % new, text, 1)
+
+
+def rename_to(path, directory, stem):
+    """Rename a file to stem within its folder. Returns where it ended up.
+
+    A name already taken gets a numeric suffix, and a file already correctly
+    named is left alone rather than renamed to "name 2".
+    """
+    path = Path(path)
+    if path.parent == Path(directory) and path.stem == stem:
+        return path
+    target = unique_path(directory, stem, path.suffix)
+    try:
+        path.rename(target)
+    except OSError:
+        return path
+    return target
 
 
 def sidecar_stat(path, tail=None):
@@ -1145,6 +1176,15 @@ class Transcriber:
         self.prompt = "" if prompt is None else str(prompt)
         self.timestamps = bool(data.get("timestamps"))
         self.max_minutes = int(data.get("max_minutes") or 240)
+        self.max_download_mb = int(data.get("max_download_mb") or 2000)
+        keep = str(data.get("keep", "video")).lower()
+        if keep in ("false", "no"):
+            keep = "none"
+        if keep not in ("none", "audio", "video"):
+            raise ConfigError(
+                "transcription.keep must be none, audio or video, got %r"
+                % data.get("keep"))
+        self.keep = keep
         captions = str(data.get("youtube_captions") or "manual").lower()
         if captions in ("true", "yes"):
             captions = "manual"
@@ -1399,20 +1439,38 @@ class Transcriber:
             return None, None
         return lines, track.split("-")[0]
 
-    def youtube_audio(self, url, workdir, progress=None):
+    def youtube_media(self, url, workdir, progress=None):
+        """Fetch the video, or its audio, or a bare wav to read and throw away.
+
+        What comes back is kept beside the transcript unless keep is none, so
+        the format is the one worth having on disk rather than the one whisper
+        wants. The wav it does want is made from this afterwards.
+        """
         base = Path(workdir) / "yt"
-        self.run([self.ytdlp, "--no-playlist", "--no-warnings", "--no-progress",
-                  "-f", "bestaudio/best", "-x", "--audio-format", "wav",
-                  "--postprocessor-args", "ffmpeg:-ac 1 -ar 16000",
-                  "-o", str(base) + ".%(ext)s", url],
-                 timeout=3600, progress=progress)
+        argv = [self.ytdlp, "--no-playlist", "--no-warnings", "--no-progress",
+                "--max-filesize", "%dM" % self.max_download_mb,
+                "-o", str(base) + ".%(ext)s"]
+        if self.keep == "video":
+            # Capped at 1080p on purpose: 4K triples the size and whisper
+            # never looks at a single pixel of it.
+            argv += ["-f", "bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/b",
+                     "--merge-output-format", "mp4"]
+        elif self.keep == "audio":
+            argv += ["-f", "bestaudio/best"]
+        else:
+            argv += ["-f", "bestaudio/best", "-x", "--audio-format", "wav",
+                     "--postprocessor-args", "ffmpeg:-ac 1 -ar 16000"]
+        self.run(argv + [url], timeout=3600, progress=progress)
         found = sorted(Path(workdir).glob("yt.*"))
         if not found:
-            raise TranscribeError("the audio would not download")
+            raise TranscribeError(
+                "nothing downloaded, which usually means the video is over the "
+                "%d MB limit" % self.max_download_mb)
         return found[0]
 
     def transcribe_youtube(self, url, workdir, progress=None):
-        """Returns (segments, language, seconds, info, engine). Captions first."""
+        """Captions first. Returns (segments, language, seconds, info, engine,
+        media), where media is the file worth keeping, or None."""
         if not self.ytdlp:
             raise TranscribeError("yt-dlp is not installed on this computer")
         info = self.youtube_info(url)
@@ -1423,21 +1481,37 @@ class Transcriber:
                 % (hhmmss(seconds), self.max_minutes))
         lines, language = self.youtube_captions(url, info, workdir)
         if lines:
+            # Captions spared us the transcription, not the download: keeping
+            # the video is a separate wish from how the words were got.
+            media = (self.youtube_media(url, workdir, progress)
+                     if self.keep != "none" else None)
             return ([(None, line) for line in lines], language, seconds, info,
-                    "the video's own captions")
+                    "the video's own captions", media)
         if not self.audio_ready():
             raise TranscribeError(
                 "that video has no subtitles and whisper is not set up here")
-        audio = self.youtube_audio(url, workdir, progress)
+        media = self.youtube_media(url, workdir, progress)
         segments, language, seconds = self.transcribe_audio(
-            audio, workdir, progress)
-        audio.unlink(missing_ok=True)
-        return segments, language, seconds, info, self.engine_label()
+            media, workdir, progress)
+        if self.keep == "none":
+            media.unlink(missing_ok=True)
+            media = None
+        return segments, language, seconds, info, self.engine_label(), media
 
 
 # Every filed item has at most one note beside it, and a transcript is added
 # to that note rather than becoming a second one.
 TRANSCRIPT_HEADING = "## Transcript"
+
+
+def transcript_stem(base, now=None):
+    """What a transcript note is called: what it is of, and when it was made.
+
+    The stamp is the transcription's own time, not the recording's, so two
+    passes over one talk sit side by side rather than one replacing the other.
+    """
+    now = now or datetime.now()
+    return "%s transcript %s" % (base, now.strftime("%Y-%m-%d %H%M"))
 
 
 def transcript_section(segments, meta, timestamps=False):
@@ -1925,7 +1999,7 @@ class Bot:
         try:
             workdir.mkdir(parents=True, exist_ok=True)
             if record.get("yt"):
-                segments, language, seconds, info, label = \
+                segments, language, seconds, info, label, media = \
                     engine.transcribe_youtube(record["yt"], workdir, progress)
                 title = (info.get("title") or "").strip()
                 meta = {"title": title or "YouTube transcript",
@@ -1935,6 +2009,7 @@ class Bot:
                 if len(stamp) == 8:
                     meta["published"] = "%s-%s-%s" % (stamp[:4], stamp[4:6],
                                                       stamp[6:])
+                base = clean_name(title, self.cfg.naming) if title else None
             else:
                 source = Path(record["path"])
                 if not source.is_file():
@@ -1944,6 +2019,7 @@ class Bot:
                     source, workdir, progress)
                 label = engine.engine_label()
                 meta = {"file": source.name}
+                media, base = None, source.stem
             meta["language"] = language_label(language) or "undetermined"
             meta["duration"] = hhmmss(seconds) if seconds else ""
             meta["transcribed-with"] = label
@@ -1953,19 +2029,26 @@ class Bot:
             log("transcription failed: %r" % (exc,))
             return self.transcript_failed(chat_id, message_id,
                                           "it went wrong: %s" % exc)
-        finally:
-            shutil.rmtree(str(workdir), ignore_errors=True)
 
         section = transcript_section(segments, meta, engine.timestamps)
+        try:
+            with self.lock:
+                live = self.live_record(chat_id, message_id)
+                cs = self.chat_state(chat_id)
+                try:
+                    path, where, kept = self.write_transcript(
+                        live or record, section, meta, base, media)
+                except OSError as exc:
+                    return self.transcript_failed(
+                        chat_id, message_id, "it could not be saved: %s" % exc)
+        finally:
+            # Only now: the kept video is still in here until write_transcript
+            # has moved it out.
+            shutil.rmtree(str(workdir), ignore_errors=True)
+
         with self.lock:
             live = self.live_record(chat_id, message_id)
             cs = self.chat_state(chat_id)
-            try:
-                path, where = self.write_transcript(live or record, section,
-                                                    meta)
-            except OSError as exc:
-                return self.transcript_failed(chat_id, message_id,
-                                              "it could not be saved: %s" % exc)
             log("transcribed (%s) -> %s"
                 % (meta["language"], rel_to(self.cfg.root, path)))
             if not live:
@@ -1976,55 +2059,92 @@ class Bot:
                     % (meta["language"], rel_to(self.cfg.root, path)))
             live.pop("transcribing", None)
             live["transcript"] = True
-            # The note grew, so whatever record points at it has to be
-            # restated or the 🗑 will refuse it as changed since filing.
+            # The note grew and was renamed, so whatever record points at it
+            # has to be restated or the 🗑 refuses it as changed since filing
+            # and a folder tap chases the old name.
             if where == "self":
+                live["stem"] = path.stem
                 restat(live, path, live["dest"])
-            elif where == "new":
-                self.note_history(cs, path, "text", "filed")
-                add_sidecar(live, path, "")
+                notes = []
             else:
-                set_sidecars(live, [sidecar_stat(path, "")])
+                # The tail is how the note keeps following its recording when
+                # a later move renames the pair.
+                anchor = Path(live["path"]).stem
+                tail = (path.stem[len(anchor):]
+                        if path.stem.startswith(anchor) else None)
+                notes = [sidecar_stat(path, tail)]
+                if where == "new":
+                    self.note_history(cs, path, "text", "filed")
+            if kept:
+                # Named for the video, not for the note, so it keeps its own
+                # name rather than following the note's stem.
+                notes.append(sidecar_stat(kept, None))
+                self.note_history(cs, kept, "media", "filed")
+            set_sidecars(live, notes)
             text = self.filed_text(
                 live, note="📝 Transcript in %s" % meta["language"])
             self.confirm(chat_id, cs, message_id, live, text)
             self.persist()
 
-    def write_transcript(self, record, section, meta):
+    def write_transcript(self, record, section, meta, base=None, media=None):
         """Put the transcript in the one note this item has, making it if
-        there is none. Returns (path, "self" | "sidecar" | "new").
+        there is none. Returns (path, "self" | "sidecar" | "new", kept),
+        where kept is the downloaded media now on disk, or None.
 
         One markdown file per thing filed. A link arrives as a note already,
         so the words go into it. A forwarded recording has a note holding
         where it came from, so they go in there. A bare recording has none,
-        so one is written.
+        so one is written. Whichever it is, the note ends up named for what it
+        is a transcript of and when it was made, because the name it arrived
+        with says nothing about the words now in it.
         """
+        directory = Path(record["path"]).parent
+        directory.mkdir(parents=True, exist_ok=True)
+        kept = self.keep_media(media, directory, base) if media else None
+        if kept:
+            meta["file"] = kept.name
         fields = [("transcript-language", meta.get("language")),
                   ("transcript-length", meta.get("duration"))]
+        stem = transcript_stem(base or Path(record["path"]).stem)
+
+        def grow(note):
+            body = add_frontmatter(note.read_text(encoding="utf-8"), fields,
+                                   tag="transcript")
+            if kept:
+                body = add_frontmatter(body, [("file", kept.name)])
+            body = retitle(body, note.stem, meta.get("title") or base)
+            note.write_text(body + section, encoding="utf-8")
+            return rename_to(note, directory, stem)
+
         if record.get("kind") == "text":
             target = Path(record["path"])
             if target.is_file():
-                body = add_frontmatter(target.read_text(encoding="utf-8"),
-                                       fields, tag="transcript")
-                target.write_text(body + section, encoding="utf-8")
-                return target, "self"
+                return grow(target), "self", kept
         notes = sidecars_of(record)
         if notes:
             target = Path(notes[0]["path"])
             if target.is_file():
-                body = add_frontmatter(target.read_text(encoding="utf-8"),
-                                       fields, tag="transcript")
-                target.write_text(body + section, encoding="utf-8")
-                return target, "sidecar"
+                return grow(target), "sidecar", kept
         source = Path(record["path"])
-        directory = source.parent
-        directory.mkdir(parents=True, exist_ok=True)
-        target = unique_path(directory, source.stem, ".md")
+        target = unique_path(directory, stem, ".md")
         target.write_text(
-            transcript_note(source.name, meta, section,
+            transcript_note(kept.name if kept else source.name, meta, section,
                             embed=record.get("kind") == "image"),
             encoding="utf-8")
-        return target, "new"
+        return target, "new", kept
+
+    def keep_media(self, media, directory, base):
+        """Move a downloaded video or audio file in beside its transcript."""
+        try:
+            target = unique_path(directory,
+                                 base or clean_name(media.stem, self.cfg.naming),
+                                 media.suffix)
+            shutil.move(str(media), str(target))
+        except (OSError, ValueError) as exc:
+            log("could not keep the download: %r" % (exc,))
+            return None
+        log("kept -> %s" % rel_to(self.cfg.root, target))
+        return target
 
     def transcript_failed(self, chat_id, message_id, reason):
         """Put the button back: a failure worth retrying usually is."""

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Transcription: link detection, caption cleaning, and the button flow."""
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -123,6 +124,31 @@ check("nothing is lost",
       sum(len(x.split()) for x in sentences))
 check("one short line stays one paragraph",
       chute.paragraphs(["Just this."]), ["Just this."])
+
+
+section("a renamed note does not keep a heading naming the old file")
+check("the heading follows the file",
+      chute.retitle("# 2026-08-22 2118 Note\n\nbody\n",
+                    "2026-08-22 2118 Note", "Root of Trust"),
+      "# Root of Trust\n\nbody\n")
+check("a heading someone wrote themselves is left alone",
+      chute.retitle("# My own title\n", "2026-08-22 2118 Note", "Root of Trust"),
+      "# My own title\n")
+check("a deeper heading is not a title",
+      chute.retitle("## 2026-08-22 2118 Note\n", "2026-08-22 2118 Note", "X"),
+      "## 2026-08-22 2118 Note\n")
+check("nothing to rename to changes nothing",
+      chute.retitle("# a\n", "a", None), "# a\n")
+
+
+section("a transcript note says what it is of, and when it was made")
+STAMP = chute.datetime(2026, 8, 23, 0, 12)
+check("video title, the word, then the time",
+      chute.transcript_stem("Root of Trust", now=STAMP),
+      "Root of Trust transcript 2026-08-23 0012")
+check("a recording uses its own name",
+      chute.transcript_stem("2026-08-22 2045 Audio", now=STAMP),
+      "2026-08-22 2045 Audio transcript 2026-08-23 0012")
 
 
 section("the language is named, not just coded")
@@ -266,13 +292,20 @@ class FakeEngine:
         progress(50)
         return [(0.0, "Words from the recording.")], "he", 90.0
 
+    keep = "video"
+
     def transcribe_youtube(self, url, workdir, progress=None):
         self.calls.append(("youtube", url))
         if self.fail:
             raise chute.TranscribeError(self.fail)
+        media = None
+        if self.keep != "none":
+            media = Path(workdir) / "yt.mp4"
+            media.parent.mkdir(parents=True, exist_ok=True)
+            media.write_bytes(b"FAKE VIDEO")
         return ([(None, "Words from the video.")], "en", 600.0,
                 {"title": "Root of Trust", "uploader": "Web3 Devs",
-                 "upload_date": "20260801"}, "the video's own captions")
+                 "upload_date": "20260801"}, "the video's own captions", media)
 
 
 chute.Telegram = FakeTelegram
@@ -355,8 +388,9 @@ check("the chat is told at once, before any work",
       "Transcribing" in edits[-1], True)
 settle()
 audio = filed_path(voice_msg)
-note_path = audio.with_suffix(".md")
-check("a note appeared, named after the recording", note_path.is_file(), True)
+made = list(INBOX.glob(audio.stem + " transcript *.md"))
+check("a note appeared, named for the recording and the time", len(made), 1)
+note_path = made[0]
 check("exactly one markdown for that recording",
       len(list(INBOX.glob(audio.stem + "*.md"))), 1)
 note = note_path.read_text()
@@ -381,7 +415,8 @@ section("the note travels with its recording")
 bot.handle(tap(7, "b:work", voice_msg))
 moved = filed_path(voice_msg)
 check("the recording moved", (moved.parent, moved.parent.name), (WORK, "Work"))
-check("its note came too", moved.with_suffix(".md").is_file(), True)
+check("its note came too",
+      len(list(WORK.glob(moved.stem + " transcript *.md"))), 1)
 check("still one markdown, not two",
       len(list(WORK.glob(moved.stem + "*.md"))), 1)
 check("and none was left behind", note_path.exists(), False)
@@ -402,9 +437,21 @@ bot.handle(tap(9, "b:__transcribe", link_msg))
 settle()
 check("the engine was given the canonical url",
       FakeEngine.calls[-1], ("youtube", WATCH))
-check("no second markdown appeared",
-      sorted(set(INBOX.glob("*.md")) - before_notes), [])
-vbody = receipt.read_text()
+check("the note it arrived as is gone, renamed not copied",
+      receipt.exists(), False)
+renamed = filed_path(link_msg)
+check("the count of notes did not grow, it was the same file renamed",
+      len(list(INBOX.glob("*.md"))), len(before_notes))
+check("named for the video and the moment",
+      bool(re.match(r"Root of Trust transcript \d{4}-\d{2}-\d{2} \d{4}$",
+                    renamed.stem)), True)
+check("the video was kept beside it",
+      (INBOX / "Root of Trust.mp4").is_file(), True)
+vbody = renamed.read_text()
+check("the note points at the video kept next to it",
+      'file: "Root of Trust.mp4"' in vbody, True)
+check("and its heading names the video, not the old filename",
+      "# Root of Trust" in vbody, True)
 check("the link exactly as it arrived is still there",
       "https://youtu.be/dQw4w9WgXcQ" in vbody, True)
 check("the words were appended", "Words from the video." in vbody, True)
@@ -416,9 +463,12 @@ check("captions were credited, not whisper",
 check("the language reached the frontmatter",
       'transcript-language: "English (en)"' in vbody, True)
 bot.handle(tap(10, "b:personal", link_msg))
-check("and the one note moves as one file",
-      [str(x.parent.relative_to(root)) for x in root.rglob(receipt.name)],
-      ["Personal/Attachments"])
+PERSONAL = root / "Personal/Attachments"
+check("the note moved", len(list(PERSONAL.glob("Root of Trust transcript *.md"))), 1)
+check("and the video came with it",
+      (PERSONAL / "Root of Trust.mp4").is_file(), True)
+check("leaving neither behind",
+      sorted(p.name for p in INBOX.glob("Root of Trust*")), [])
 
 section("a failure explains itself and offers the button again")
 bot.handle(voice(20))
@@ -432,9 +482,9 @@ check("the button comes back",
 FakeEngine.fail = None
 bot.handle(tap(22, "b:__transcribe", failing))
 settle()
+retried = list(INBOX.glob(filed_path(failing).stem + " transcript *.md"))
 check("and a retry works",
-      "## Transcript" in filed_path(failing).with_suffix(".md").read_text(),
-      True)
+      len(retried) == 1 and "## Transcript" in retried[0].read_text(), True)
 
 section("a recording deleted while it runs still yields its transcript")
 
