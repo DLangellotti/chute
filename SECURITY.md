@@ -108,6 +108,37 @@ recording is refused rather than left grinding.
 **It is optional and it is off when absent.** Missing binaries mean the button
 never appears; `transcription.enabled: false` turns it off with them present.
 
+## A Bot API server of your own
+
+Optional, off by default, and the one part of Chute that puts a service on your
+machine. Worth reading before turning it on.
+
+**It holds the bot token and the api_hash.** The container is given both. The
+token lets whoever has it read everything sent to the bot; the api_hash belongs
+to your Telegram account, not just the bot. Keep them out of shell history and
+out of git.
+
+**It listens on localhost only** as shipped, bound to `127.0.0.1:8081`. Do not
+publish that port. There is no authentication in front of it beyond the token
+in the URL path.
+
+**Everything sent passes through a folder on disk.** The server writes each
+file into `~/.telegram-bot-api` before Chute sees it. Chute moves the file out
+rather than copying, so it does not linger, but anything the server wrote and
+Chute never collected stays there until removed.
+
+**Chute trusts the path the server reports.** It is translated from the
+container prefix and read from disk. That is a local service you started, so
+the trust is the same trust you place in the container image.
+
+**Logging out is not reversible for 10 minutes.** `chute logout` deregisters
+the bot from Telegram's servers, and they refuse it for 10 minutes afterwards.
+Messages sent in that window are lost rather than queued.
+
+**The size cap is yours alone now.** Telegram's 20 MB ceiling no longer
+applies, so `security.max_file_mb` is the only thing between an authorised
+account and your free disk space.
+
 ## What is not
 
 Chute does not scan file contents. If you send it a malicious PDF, it files a

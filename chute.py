@@ -43,13 +43,17 @@ LOCK_PATH = HERE / "chute.lock"
 LOG_PATH = HERE / "chute.log"
 STATE_PATH = HERE / "state.json"
 
-API_ROOT = "https://api.telegram.org"
+CLOUD_API = "https://api.telegram.org"
+# Telegram's own cap on what a bot may download from its servers. A bot talking
+# to a self-hosted Bot API server is not subject to it: there, getFile hands
+# back a path on disk and nothing is transferred at all.
+CLOUD_CEILING = 20 * 1024 * 1024
 POLL_TIMEOUT = 50                     # seconds Telegram holds getUpdates open
 HISTORY_KEEP = 200                    # filings remembered per chat for /history
 HISTORY_SHOW = 15                     # lines /history prints at once
 FILED_KEEP = 200                      # movable messages remembered per chat
 FILED_TTL = 7 * 86400                 # and only for a week
-TG_DOWNLOAD_CEILING = 20 * 1024 * 1024   # Bot API hard limit, not ours to raise
+
 
 KINDS = ("image", "document", "media", "text")
 
@@ -345,6 +349,14 @@ class Config:
         except (TypeError, ValueError):
             raise ConfigError("allowed_user_ids must be numbers")
 
+        self.api_root = str(data.get("api_root") or CLOUD_API).rstrip("/")
+        self.local_api = self.api_root != CLOUD_API
+        mapping = data.get("local_api") or {}
+        self.files_from = str(mapping.get("files_from")
+                              or "/var/lib/telegram-bot-api")
+        self.files_to = str(Path(str(mapping.get("files_to")
+                                     or "~/.telegram-bot-api")).expanduser())
+
         root = data.get("root") or data.get("vault")
         if not root:
             raise ConfigError("root is not set")
@@ -372,8 +384,10 @@ class Config:
         self.blocked_ext = set(
             e.lower() if e.startswith(".") else "." + e.lower()
             for e in sec.get("blocked_extensions", DEFAULT_BLOCKED_EXT))
-        self.max_bytes = min(
-            int(sec.get("max_file_mb", 20)) * 1024 * 1024, TG_DOWNLOAD_CEILING)
+        wanted = int(sec.get("max_file_mb", 20)) * 1024 * 1024
+        # Against Telegram's own servers their limit wins whatever the config
+        # says. Against a local one there is no ceiling but the configured one.
+        self.max_bytes = wanted if self.local_api else min(wanted, CLOUD_CEILING)
         # Silent by default. Replying confirms the bot is live to anyone who
         # finds it, and lets a stranger burn the bot's rate limit with noise.
         self.reply_to_strangers = bool(sec.get("reply_to_strangers", False))
@@ -484,11 +498,28 @@ def explain_network_error(exc):
 
 
 class Telegram:
-    def __init__(self, token):
+    def __init__(self, token, api_root=CLOUD_API, files_from=None,
+                 files_to=None):
         self.token = token
+        self.api_root = (api_root or CLOUD_API).rstrip("/")
+        # A local server run in a container reports the path it sees. Chute
+        # sees the same file at a different prefix on the host.
+        self.files_from = files_from
+        self.files_to = files_to
+
+    def local_path(self, file_path):
+        """Where a local server's file actually is, from Chute's side."""
+        if not str(file_path).startswith("/"):
+            return None
+        if self.files_from and self.files_to:
+            prefix = self.files_from.rstrip("/")
+            if str(file_path).startswith(prefix + "/"):
+                return Path(self.files_to.rstrip("/")
+                            + str(file_path)[len(prefix):])
+        return Path(file_path)
 
     def call(self, method, **params):
-        url = "%s/bot%s/%s" % (API_ROOT, self.token, method)
+        url = "%s/bot%s/%s" % (self.api_root, self.token, method)
         body = json.dumps(params).encode("utf-8")
         req = urllib.request.Request(
             url, data=body, headers={"Content-Type": "application/json"})
@@ -544,7 +575,25 @@ class Telegram:
             raise ValueError("file is %.1f MB, over the %.0f MB limit"
                              % (size / 1048576.0, max_bytes / 1048576.0))
         path = info["file_path"]
-        url = "%s/file/bot%s/%s" % (API_ROOT, self.token,
+        local = self.local_path(path)
+        if local:
+            # A local server has already written the file. Move it out rather
+            # than copy: in local mode those files are the caller's to clean
+            # up, and a 2 GB copy would sit on disk twice.
+            if not local.is_file():
+                raise ValueError(
+                    "the local Bot API server reported %s, which is not there. "
+                    "Check that its files folder is shared with Chute." % local)
+            try:
+                shutil.move(str(local), str(dest))
+            except OSError:
+                shutil.copyfile(str(local), str(dest))
+                try:
+                    local.unlink()
+                except OSError:
+                    pass
+            return path
+        url = "%s/file/bot%s/%s" % (self.api_root, self.token,
                                     urllib.parse.quote(path, safe="/"))
         with urllib.request.urlopen(url, timeout=180) as resp, open(dest, "wb") as fh:
             shutil.copyfileobj(resp, fh, 256 * 1024)
@@ -1588,7 +1637,8 @@ def transcript_note(filename, meta, section, embed=False):
 class Bot:
     def __init__(self, cfg):
         self.cfg = cfg
-        self.tg = Telegram(cfg.token)
+        self.tg = Telegram(cfg.token, cfg.api_root, cfg.files_from,
+                           cfg.files_to)
         self.state = load_json(STATE_PATH, {}) or {}
         self.state.setdefault("offset", 0)
         self.state.setdefault("chats", {})
@@ -2981,7 +3031,7 @@ def cmd_check(args):
         print("Paths:  FAILED\n  %s" % exc)
         return 1
     try:
-        me = Telegram(cfg.token).call("getMe")
+        me = Telegram(cfg.token, cfg.api_root).call("getMe")
         print("Bot:    @%s  ok" % me.get("username"))
     except ConfigError as exc:
         print("Bot:    FAILED\n  %s" % exc)
@@ -3004,6 +3054,16 @@ def cmd_check(args):
         print("Speech: unavailable, so the transcribe button will not appear")
         for gap in tr.missing():
             print("  needs %s" % gap)
+    if cfg.local_api:
+        print("Server: %s  (your own, so no 20 MB download limit)"
+              % cfg.api_root)
+        print("        files at %s, seen by the server as %s"
+              % (cfg.files_to, cfg.files_from))
+        if not Path(cfg.files_to).is_dir():
+            print("        WARNING: that folder does not exist yet. Nothing "
+                  "sent will be readable until the server has written to it.")
+    else:
+        print("Server: Telegram's own, which caps downloads at 20 MB")
     print("Limits: %.0f MB max, %d blocked extensions"
           % (cfg.max_bytes / 1048576.0, len(cfg.blocked_ext)))
     print("\nDestinations:")
@@ -3018,6 +3078,41 @@ def cmd_check(args):
     for w in warnings:
         print("\nWarning: %s" % w)
     print("\nEverything looks good.")
+    return 0
+
+
+def cmd_logout(args):
+    """Deregister the bot from Telegram's servers, so a local one can have it.
+
+    Deliberately its own command and never a side effect of editing the
+    config. A bot logged in on two servers is not guaranteed to receive
+    anything, and coming back to Telegram's servers is barred for 10 minutes
+    after this runs.
+    """
+    cfg = load_config(args.config)
+    if cfg.local_api:
+        print("api_root already points at %s." % cfg.api_root)
+        print("Set it back to %s before logging out, or you will log out of "
+              "your own server instead." % CLOUD_API)
+        return 1
+    print("This deregisters @your bot from %s so that your own Bot API server "
+          "can take it over." % CLOUD_API)
+    print()
+    print("  · Telegram will refuse the bot for 10 minutes afterwards, so if "
+          "the local server is not ready, the bot is simply down until then.")
+    print("  · Point api_root at the local server as soon as this finishes.")
+    print("  · Anything sent in between is lost, not queued.")
+    print()
+    if not ask_bool("Log out of Telegram's servers now?", False):
+        print("Nothing done.")
+        return 1
+    try:
+        Telegram(cfg.token, CLOUD_API).call("logOut")
+    except Exception as exc:
+        print("logOut failed: %s" % exc, file=sys.stderr)
+        return 1
+    print("\nDone. The bot is now yours to point somewhere else.")
+    print("Set api_root in %s, then:  %s restart" % (cfg.source, cli_name()))
     return 0
 
 
@@ -3064,6 +3159,8 @@ def main():
             return cmd_setup(args)
         if args.action == "check":
             return cmd_check(args)
+        if args.action == "logout":
+            return cmd_logout(args)
         if args.action == "config":
             return cmd_config(args)
         if args.action == "run":
@@ -3076,8 +3173,8 @@ def main():
     except ConfigError as exc:
         print("Problem with your settings: %s" % exc, file=sys.stderr)
         return 2
-    print("Unknown command %r. Commands: setup, config, check, run, version."
-          % args.action, file=sys.stderr)
+    print("Unknown command %r. Commands: setup, config, check, logout, run, "
+          "version." % args.action, file=sys.stderr)
     print("Full help:  %s help" % cli_name(), file=sys.stderr)
     return 1
 

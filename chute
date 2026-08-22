@@ -90,6 +90,12 @@ TROUBLESHOOTING
   test         Run the test suite. No network, no dependencies.
   version      Print the version.
 
+BIGGER FILES
+  logout       Deregister the bot from Telegram's servers so a Bot API server
+               of your own can take it over, lifting the 20 MB download limit.
+               See service/telegram-bot-api.yml. Telegram bars the bot for 10
+               minutes afterwards, so start your server first.
+
 REMOVING
   uninstall    Remove the service. Leaves config.json and your files alone.
 
@@ -113,6 +119,7 @@ CHUTE_HELP
 case "${1:-status}" in
   help|-h|--help) usage; exit 0 ;;
   setup)   exec "$PY" "$SCRIPT" setup "${@:2}" ;;
+  logout)  exec "$PY" "$SCRIPT" logout "${@:2}" ;;
   check)   exec "$PY" "$SCRIPT" check "${@:2}" ;;
   config)  exec "$PY" "$SCRIPT" config "${@:2}" ;;
   fg|run)  exec "$PY" "$SCRIPT" run "${@:2}" ;;

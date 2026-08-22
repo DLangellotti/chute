@@ -8,7 +8,7 @@ import tempfile
 import threading
 from pathlib import Path
 
-from harness import check, section, make_config, report  # noqa: F401
+from harness import check, raises, section, make_config, report  # noqa: F401
 import chute
 
 root = Path(tempfile.mkdtemp()).resolve() / "Root"
@@ -124,6 +124,58 @@ check("nothing is lost",
       sum(len(x.split()) for x in sentences))
 check("one short line stays one paragraph",
       chute.paragraphs(["Just this."]), ["Just this."])
+
+
+section("a local Bot API server hands over paths, not URLs")
+cloud = chute.Telegram("t")
+check("no local path from Telegram's own server",
+      cloud.local_path("photos/file_1.jpg"), None)
+mapped = chute.Telegram("t", "http://localhost:8081",
+                        "/var/lib/telegram-bot-api", "/Users/x/.tba")
+check("the container prefix is swapped for the host one",
+      str(mapped.local_path("/var/lib/telegram-bot-api/123/videos/f.mp4")),
+      "/Users/x/.tba/123/videos/f.mp4")
+check("a relative path is still a URL to fetch",
+      mapped.local_path("videos/f.mp4"), None)
+check("a path outside the mapping is taken as it is",
+      str(mapped.local_path("/somewhere/else/f.mp4")), "/somewhere/else/f.mp4")
+unmapped = chute.Telegram("t", "http://localhost:8081")
+check("with no mapping the server's own path is used",
+      str(unmapped.local_path("/var/lib/telegram-bot-api/f.mp4")),
+      "/var/lib/telegram-bot-api/f.mp4")
+check("the api root loses a trailing slash",
+      chute.Telegram("t", "http://localhost:8081/").api_root,
+      "http://localhost:8081")
+
+
+section("a file from a local server is moved, not fetched")
+served = Path(tempfile.mkdtemp())
+(served / "123" / "videos").mkdir(parents=True)
+big = served / "123" / "videos" / "big.mp4"
+big.write_bytes(b"a big video" * 100)
+
+
+class ServedTelegram(chute.Telegram):
+    def call(self, method, **params):
+        return {"file_path": "/var/lib/telegram-bot-api/123/videos/big.mp4",
+                "file_size": big.stat().st_size}
+
+
+local = ServedTelegram("t", "http://localhost:8081",
+                       "/var/lib/telegram-bot-api", str(served))
+landed = Path(tempfile.mkdtemp()) / "out.mp4"
+local.download("fid", landed, 2000 * 1024 * 1024)
+check("the file arrived", landed.read_bytes(), b"a big video" * 100)
+check("and the server's copy was not left behind", big.exists(), False)
+big.write_bytes(b"a big video" * 100)
+raises("one over the limit never gets read",
+       lambda: local.download("fid", landed, 10), ValueError)
+check("so it is still sitting on the server", big.is_file(), True)
+raises("a file the server promised but did not write is refused",
+       lambda: ServedTelegram("t", "http://localhost:8081",
+                              "/var/lib/telegram-bot-api",
+                              "/nowhere").download("fid", landed, 1 << 30),
+       ValueError)
 
 
 section("a renamed note does not keep a heading naming the old file")

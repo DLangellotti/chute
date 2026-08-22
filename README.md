@@ -80,6 +80,26 @@ That model is 574 MB and handles about 100 languages. Any `ggml-*.bin` in
 An hour of audio takes a few minutes on an Apple Silicon Mac, and the bot keeps
 filing everything else while it runs.
 
+## Bigger files
+
+Telegram caps what a bot may download at 20 MB. That is their limit, not a
+setting here, and no config raises it: about two minutes of video. The way past
+it is to run a Bot API server of your own, which removes the download limit and
+raises sending to 2000 MB. `getFile` then returns a path on disk, so Chute
+picks the file up locally and nothing is transferred over HTTP at all.
+
+It is optional and off by default. `service/telegram-bot-api.yml` has the
+container and the four steps. Two things to know before starting:
+
+- It needs an `api_id` and `api_hash` from [my.telegram.org](https://my.telegram.org),
+  which are separate from the bot token, and Docker running whenever Chute is.
+- `./chute logout` deregisters the bot from Telegram's servers so yours can
+  take it over. Telegram then refuses the bot for 10 minutes, so bring the
+  container up first. Anything sent in that window is lost rather than queued.
+
+`./chute check` names whichever server is in use and the size cap that follows
+from it.
+
 ## Commands
 
 | | |
@@ -89,6 +109,7 @@ filing everything else while it runs.
 | `./chute config` | folders, root, users, token |
 | `./chute restart` | apply changes |
 | `./chute check` | validate settings |
+| `./chute logout` | hand the bot to your own Bot API server |
 | `./chute help` | everything else |
 
 In Telegram: `/history` and `/help`.

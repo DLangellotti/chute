@@ -109,9 +109,17 @@ check("explicit key honoured",
           {"label": "X", "path": "X", "key": "kk", "catch_all": True}]
                   ).destinations[0].key, "kk")
 check("blocked extensions defaulted", ".app" in cfg.blocked_ext, True)
-check("max size clamped to telegram ceiling",
+check("max size clamped to telegram's ceiling",
       make_config(root, security={"max_file_mb": 999}).max_bytes,
-      chute.TG_DOWNLOAD_CEILING)
+      chute.CLOUD_CEILING)
+check("but not when the server is your own",
+      make_config(root, security={"max_file_mb": 999},
+                  api_root="http://localhost:8081").max_bytes,
+      999 * 1024 * 1024)
+check("and a smaller setting still wins either way",
+      make_config(root, security={"max_file_mb": 5},
+                  api_root="http://localhost:8081").max_bytes,
+      5 * 1024 * 1024)
 warn = make_config(root, destinations=[{"label": "D%d" % i, "path": "D%d" % i}
                                        for i in range(14)]).validate_paths()
 check("warns past 12 destinations", any("unwieldy" in w for w in warn), True)
