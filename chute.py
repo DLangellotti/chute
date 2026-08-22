@@ -1083,6 +1083,34 @@ def vtt_to_lines(raw):
     return lines
 
 
+def explain_ytdlp_error(text):
+    """Turn a yt-dlp failure into something worth reading in a chat.
+
+    YouTube blocks the player clients yt-dlp impersonates, and yt-dlp rotates
+    to working ones with each release. A 403 on the media almost always means
+    the installed copy has fallen behind rather than anything about the video,
+    so say that rather than printing the status code.
+    """
+    lowered = (text or "").lower()
+    if "403" in lowered or "forbidden" in lowered:
+        return ("YouTube refused the download. This is nearly always yt-dlp "
+                "having fallen behind: upgrade it (brew upgrade yt-dlp) and "
+                "tap again")
+    if "sign in to confirm" in lowered or "not a bot" in lowered:
+        return ("YouTube wants to check this is not a bot. Upgrading yt-dlp "
+                "usually clears it; otherwise the video needs a signed-in "
+                "session")
+    if "private video" in lowered or "members-only" in lowered:
+        return "that video is not public"
+    if "video unavailable" in lowered or "removed" in lowered:
+        return "that video is not available"
+    if "age" in lowered and "confirm" in lowered:
+        return "that video is age restricted, so it cannot be fetched"
+    if "live event will begin" in lowered or "premieres in" in lowered:
+        return "that has not been broadcast yet"
+    return None
+
+
 class TranscribeError(Exception):
     """Something in the transcription chain said no, with a reason to show."""
 
@@ -1238,9 +1266,13 @@ class Transcriber:
                 except OSError:
                     pass
         if proc.returncode != 0:
+            name = Path(argv[0]).name
             reason = " / ".join(tail[-3:])
-            raise TranscribeError("%s failed: %s"
-                                  % (Path(argv[0]).name, reason or "no output"))
+            if name.startswith("yt-dlp"):
+                plain = explain_ytdlp_error(" ".join(tail))
+                if plain:
+                    raise TranscribeError(plain)
+            raise TranscribeError("%s failed: %s" % (name, reason or "no output"))
         return b"".join(out).decode("utf-8", "replace")
 
     # -- audio

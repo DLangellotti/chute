@@ -67,6 +67,25 @@ check("a missing binary is simply not offered",
       chute.Transcriber({"whisper_bin": "/nowhere/whisper"}).audio_ready(), False)
 
 
+section("a yt-dlp failure is explained, not printed at you")
+for label, raw, want in [
+        ("a blocked download blames the version",
+         "ERROR: unable to download video data: HTTP Error 403: Forbidden",
+         "brew upgrade yt-dlp"),
+        ("a bot check says what it is",
+         "ERROR: Sign in to confirm you're not a bot", "not a bot"),
+        ("a dead video is about the video",
+         "ERROR: [youtube] abc: Video unavailable", "not available"),
+        ("so is a private one",
+         "ERROR: Private video. Sign in if you've been granted access",
+         "not public")]:
+    check(label, want in (chute.explain_ytdlp_error(raw) or ""), True)
+check("anything unrecognised is passed through untouched",
+      chute.explain_ytdlp_error("ERROR: brand new failure mode"), None)
+check("and an empty one does not crash",
+      chute.explain_ytdlp_error(""), None)
+
+
 section("captions are cleaned of markup and of their rolling repeats")
 VTT = """WEBVTT
 Kind: captions
