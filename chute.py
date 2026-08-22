@@ -6,7 +6,9 @@ Point it at any folder tree: an Obsidian vault, a Logseq graph, a NAS share, a
 plain Downloads folder. Send the bot anything Telegram carries: photos, any
 file, audio, video, links, forwarded messages. It lands in your Inbox folder as it
 arrives, named by date and type or by your caption, and the buttons on the
-reply move it. Polling only, so it works behind NAT with no public URL.
+reply move it. Send audio, video or a YouTube link and it offers to transcribe
+it too, locally with whisper.cpp. Polling only, so it works behind NAT with no
+public URL.
 
     chute.py setup     one-time: bot token, root folder, destinations
     chute.py run       long-poll Telegram and file what arrives
@@ -21,7 +23,9 @@ import os
 import re
 import shutil
 import string
+import subprocess
 import sys
+import threading
 import time
 import unicodedata
 import urllib.error
@@ -30,7 +34,7 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 APP = "chute"
 
 HERE = Path(__file__).resolve().parent
@@ -113,6 +117,35 @@ TOKEN_RE = re.compile(r"^\d{5,12}:[A-Za-z0-9_-]{25,}$")
 def clean_token(raw):
     """Strip the quotes and stray spaces a pasted token often arrives with."""
     return (raw or "").strip().strip("'\"").strip()
+
+
+# Where package managers put things. Searched after PATH, because a service
+# started by launchd or systemd inherits almost none of a login shell's PATH:
+# on macOS it is /usr/bin:/bin:/usr/sbin:/sbin, which has no Homebrew in it.
+# Without this, an optional helper works when Chute is run from a terminal and
+# silently does not exist when it runs the way it is meant to.
+BIN_DIRS = [
+    "/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin",
+    "~/.local/bin", "/home/linuxbrew/.linuxbrew/bin", "/snap/bin",
+]
+
+
+def which_or_path(name):
+    """Find a helper binary: an absolute path as given, else PATH, else the
+    usual install folders."""
+    if not name:
+        return None
+    if "/" in str(name):
+        path = Path(str(name)).expanduser()
+        return path if path.is_file() and os.access(str(path), os.X_OK) else None
+    found = shutil.which(str(name))
+    if found:
+        return Path(found)
+    for folder in BIN_DIRS:
+        candidate = Path(folder).expanduser() / str(name)
+        if candidate.is_file() and os.access(str(candidate), os.X_OK):
+            return candidate
+    return None
 
 
 def cli_name():
@@ -334,6 +367,7 @@ class Config:
                 "naming.style must be keep-spaces, kebab or snake, got %r" % style)
 
         self.text_capture = data.get("text_capture") or {}
+        self.transcribe = Transcriber(data.get("transcription"))
         sec = data.get("security") or {}
         self.blocked_ext = set(
             e.lower() if e.startswith(".") else "." + e.lower()
@@ -589,6 +623,9 @@ def extract_item(msg, tg, staging, cfg):
     elif (msg.get("text") or "").strip():
         item["kind"] = "text"
         item["text"] = msg["text"]
+        link = youtube_url(msg["text"])
+        if link:
+            item["youtube"] = link
         return item
     else:
         return None
@@ -748,6 +785,7 @@ def file_item(item, directory, name, cfg):
             note = unique_path(directory, dest.stem, ".md")
             note.write_text(sidecar_body(item, dest.name), encoding="utf-8")
             item["sidecar"] = str(note)
+            item["sidecar_tail"] = note.stem[len(dest.stem):]
     return dest
 
 
@@ -794,51 +832,85 @@ def verify_filed(record, root, strict=True):
     return path
 
 
-def sidecar_stat(path):
-    """The record entry for a companion note: where it is, what it looks like."""
+def sidecar_stat(path, tail=None):
+    """The record entry for a companion note: where it is, what it looks like.
+
+    A tail is the part of the note's name that follows the file's own stem,
+    empty for the companion note and " transcript" for a transcript. It is how
+    the note keeps its meaning when the file it belongs to is renamed on a
+    move. A note named independently of the file carries no tail and keeps the
+    name it has.
+    """
     st = Path(path).stat()
-    return {"path": str(path), "size": st.st_size, "mtime": int(st.st_mtime)}
+    entry = {"path": str(path), "size": st.st_size, "mtime": int(st.st_mtime)}
+    if tail is not None:
+        entry["tail"] = tail
+    return entry
+
+
+def sidecars_of(record):
+    """Every companion note on a record, reading the pre-0.4 single one too."""
+    notes = list(record.get("sidecars") or [])
+    legacy = record.get("sidecar")
+    if legacy:
+        notes.append(dict(legacy, tail=legacy.get("tail", "")))
+    return notes
+
+
+def set_sidecars(record, notes):
+    record.pop("sidecar", None)
+    if notes:
+        record["sidecars"] = notes
+    else:
+        record.pop("sidecars", None)
+
+
+def add_sidecar(record, path, tail=None):
+    set_sidecars(record, sidecars_of(record) + [sidecar_stat(path, tail)])
 
 
 def move_sidecar(record, directory, stem):
-    """Bring the companion note along when its file moves. Best effort:
+    """Bring the companion notes along when their file moves. Best effort:
     a note the user renamed or deleted by hand is simply let go."""
-    sc = record.get("sidecar")
-    if not sc:
-        return
-    note = Path(sc["path"])
-    if not note.is_file():
-        record.pop("sidecar", None)
-        return
-    target = unique_path(directory, stem, note.suffix)
-    try:
-        shutil.move(str(note), str(target))
-        record["sidecar"] = sidecar_stat(target)
-    except OSError:
-        pass
+    kept = []
+    for sc in sidecars_of(record):
+        note = Path(sc["path"])
+        if not note.is_file():
+            continue
+        tail = sc.get("tail")
+        name = stem + tail if tail is not None else note.stem
+        target = unique_path(directory, name, note.suffix)
+        try:
+            shutil.move(str(note), str(target))
+            kept.append(sidecar_stat(target, tail))
+        except OSError:
+            kept.append(sc)
+    set_sidecars(record, kept)
 
 
 def delete_sidecar(record):
-    """Remove the companion note with its file, unless it has been edited.
+    """Remove the companion notes with their file, unless they were edited.
 
     An edited note holds the user's own words now, so it survives the 🗑.
-    Returns the surviving path in that case, else None.
+    Returns the notes left standing.
     """
-    sc = record.pop("sidecar", None)
-    if not sc:
-        return None
-    note = Path(sc["path"])
-    try:
-        st = note.stat()
-    except OSError:
-        return None
-    if st.st_size != sc.get("size") or int(st.st_mtime) != sc.get("mtime"):
-        return note
-    try:
-        note.unlink()
-    except OSError:
-        return note
-    return None
+    notes = sidecars_of(record)
+    set_sidecars(record, [])
+    survivors = []
+    for sc in notes:
+        note = Path(sc["path"])
+        try:
+            st = note.stat()
+        except OSError:
+            continue
+        if st.st_size != sc.get("size") or int(st.st_mtime) != sc.get("mtime"):
+            survivors.append(note)
+            continue
+        try:
+            note.unlink()
+        except OSError:
+            survivors.append(note)
+    return survivors
 
 
 def move_filed(record, directory, root):
@@ -899,6 +971,451 @@ def remember(filed, message_id, record, now=None):
     return filed
 
 
+# ---------------------------------------------------------------- transcription
+
+# Video counts as transcribable: the sound is pulled out of it first.
+VIDEO_EXT = {".mp4", ".m4v", ".mov", ".mkv", ".webm", ".avi", ".mpg", ".mpeg",
+             ".wmv", ".3gp", ".ts"}
+
+# youtube.com/watch, youtu.be, /shorts, /live and /embed, with or without the
+# tracking parameters a share sheet adds.
+YOUTUBE_RE = re.compile(
+    r"https?://(?:www\.|m\.|music\.)?"
+    r"(?:youtube\.com/(?:watch\?(?:[^\s&]*&)*v=|shorts/|live/|embed/|v/)"
+    r"|youtu\.be/)([A-Za-z0-9_-]{11})")
+
+# Whisper reports a two-letter code. Written out, a transcript's frontmatter
+# says something to a person reading it a year later.
+LANGUAGE_NAMES = {
+    "ar": "Arabic", "cs": "Czech", "da": "Danish", "de": "German",
+    "el": "Greek", "en": "English", "es": "Spanish", "fa": "Persian",
+    "fi": "Finnish", "fr": "French", "he": "Hebrew", "hi": "Hindi",
+    "hu": "Hungarian", "id": "Indonesian", "it": "Italian", "ja": "Japanese",
+    "ko": "Korean", "nl": "Dutch", "no": "Norwegian", "pl": "Polish",
+    "pt": "Portuguese", "ro": "Romanian", "ru": "Russian", "sv": "Swedish",
+    "th": "Thai", "tr": "Turkish", "uk": "Ukrainian", "vi": "Vietnamese",
+    "yi": "Yiddish", "zh": "Chinese",
+}
+
+# Where a whisper.cpp model tends to sit. Checked in order, and within a
+# folder the largest model wins, since that is the one deliberately fetched.
+MODEL_DIRS = [
+    "~/.cache/whisper",
+    "~/Library/Application Support/chute/models",
+    "~/.local/share/chute/models",
+    "/opt/homebrew/share/whisper-cpp/models",
+    "/usr/local/share/whisper-cpp/models",
+    "/usr/share/whisper.cpp/models",
+]
+
+PROGRESS_RE = re.compile(r"progress\s*=\s*(\d+)%")
+
+
+def youtube_url(text):
+    """The canonical watch URL for the first YouTube link in some text."""
+    match = YOUTUBE_RE.search(text or "")
+    return "https://www.youtube.com/watch?v=%s" % match.group(1) if match else None
+
+
+def language_label(code):
+    code = (code or "").strip().lower()
+    if not code or code == "auto":
+        return ""
+    short = code.split("-")[0]
+    name = LANGUAGE_NAMES.get(short)
+    return "%s (%s)" % (name, short) if name else short
+
+
+def hhmmss(seconds):
+    seconds = int(seconds or 0)
+    return "%d:%02d:%02d" % (seconds // 3600, seconds % 3600 // 60, seconds % 60)
+
+
+def paragraphs(sentences, width=600):
+    """Group a run of transcript text into paragraphs a person can read.
+
+    Speech has no paragraph breaks in it, so this invents them at sentence
+    ends, which is the only honest place to put one.
+    """
+    out, buf = [], ""
+    for piece in sentences:
+        piece = piece.strip()
+        if not piece:
+            continue
+        buf = (buf + " " + piece).strip()
+        if len(buf) >= width and re.search(r"[.!?。？！]['\")\]]?$", buf):
+            out.append(buf)
+            buf = ""
+    if buf:
+        out.append(buf)
+    return out
+
+
+def vtt_to_lines(raw):
+    """Plain caption lines from a WebVTT file, with the rolling repeats gone.
+
+    YouTube's captions repeat the previous line at the top of the next cue so
+    the text scrolls. Kept as-is that doubles every sentence in the file.
+    """
+    lines, previous = [], ""
+    for line in (raw or "").splitlines():
+        text = line.strip()
+        if (not text or "-->" in text or text.isdigit()
+                or text.startswith(("WEBVTT", "Kind:", "Language:", "NOTE",
+                                    "STYLE", "REGION"))):
+            continue
+        text = re.sub(r"<[^>]*>", "", text)
+        for entity, char in (("&nbsp;", " "), ("&amp;", "&"), ("&lt;", "<"),
+                             ("&gt;", ">"), ("&#39;", "'"), ("&quot;", '"')):
+            text = text.replace(entity, char)
+        text = re.sub(r"\s+", " ", text).strip()
+        if not text or text == previous:
+            continue
+        # A cue that merely extends the one before it: keep only the new part.
+        if previous and text.startswith(previous):
+            addition = text[len(previous):].strip()
+            if addition:
+                lines.append(addition)
+            previous = text
+            continue
+        lines.append(text)
+        previous = text
+    return lines
+
+
+class TranscribeError(Exception):
+    """Something in the transcription chain said no, with a reason to show."""
+
+
+class Transcriber:
+    """Speech to text on this computer: whisper.cpp, with yt-dlp for YouTube.
+
+    Neither binary is a dependency of Chute. When they are missing the button
+    never appears and everything else works exactly as before.
+    """
+
+    def __init__(self, data=None):
+        data = data or {}
+        self.enabled = data.get("enabled", True) is not False
+        self.whisper = which_or_path(data.get("whisper_bin") or "whisper-cli")
+        self.ffmpeg = which_or_path(data.get("ffmpeg_bin") or "ffmpeg")
+        self.ytdlp = which_or_path(data.get("ytdlp_bin") or "yt-dlp")
+        self.model = self.find_model(data.get("model"))
+        self.language = str(data.get("language") or "auto").strip() or "auto"
+        self.threads = int(data.get("threads") or 0)
+        self.timestamps = bool(data.get("timestamps"))
+        self.max_minutes = int(data.get("max_minutes") or 240)
+        captions = str(data.get("youtube_captions") or "manual").lower()
+        if captions in ("true", "yes"):
+            captions = "manual"
+        if captions in ("false", "no"):
+            captions = "off"
+        if captions not in ("manual", "any", "off"):
+            raise ConfigError(
+                "transcription.youtube_captions must be manual, any or off, "
+                "got %r" % data.get("youtube_captions"))
+        self.captions = captions
+
+    @staticmethod
+    def find_model(configured):
+        """The whisper model file: the configured one, or the biggest found."""
+        if configured:
+            path = Path(str(configured)).expanduser()
+            return path if path.is_file() else None
+        env = os.environ.get("WHISPER_MODEL")
+        if env and Path(env).expanduser().is_file():
+            return Path(env).expanduser()
+        for folder in MODEL_DIRS:
+            try:
+                found = sorted(
+                    (p for p in Path(folder).expanduser().glob("ggml-*.bin")
+                     if p.is_file()),
+                    key=lambda p: p.stat().st_size, reverse=True)
+            except OSError:
+                continue
+            if found:
+                return found[0]
+        return None
+
+    def env(self):
+        """The environment for a helper: PATH with our own finds on the front.
+
+        yt-dlp looks up ffmpeg and ffprobe by name. Under a service PATH it
+        would not find them even though Chute just did.
+        """
+        env = dict(os.environ)
+        folders = [str(b.parent) for b in (self.whisper, self.ffmpeg, self.ytdlp)
+                   if b]
+        seen, ordered = set(), []
+        for folder in folders + env.get("PATH", "").split(os.pathsep):
+            if folder and folder not in seen:
+                seen.add(folder)
+                ordered.append(folder)
+        env["PATH"] = os.pathsep.join(ordered)
+        return env
+
+    def engine_label(self):
+        return "whisper.cpp %s" % (self.model_name() or "whisper")
+
+    def model_name(self):
+        if not self.model:
+            return ""
+        return re.sub(r"^ggml-", "", self.model.stem)
+
+    def audio_ready(self):
+        return bool(self.enabled and self.whisper and self.model and self.ffmpeg)
+
+    def youtube_ready(self):
+        if not (self.enabled and self.ytdlp):
+            return False
+        return self.captions != "off" or self.audio_ready()
+
+    def missing(self):
+        """What is not installed, in the order worth fixing it."""
+        gaps = []
+        if not self.whisper:
+            gaps.append("whisper-cli (brew install whisper-cpp)")
+        if not self.model:
+            gaps.append("a whisper model in ~/.cache/whisper "
+                        "(ggml-large-v3-turbo-q5_0.bin from "
+                        "huggingface.co/ggerganov/whisper.cpp)")
+        if not self.ffmpeg:
+            gaps.append("ffmpeg (brew install ffmpeg)")
+        if not self.ytdlp:
+            gaps.append("yt-dlp, for YouTube links (brew install yt-dlp)")
+        return gaps
+
+    # -- running things
+
+    def run(self, argv, timeout, workdir=None, progress=None):
+        """Run a command, returning its stdout.
+
+        Both pipes are drained by threads of their own rather than by
+        communicate(), because stderr has to be read line by line as it
+        arrives: that is where whisper reports how far through it is, and a
+        pipe nobody empties fills up and stops the program that is writing it.
+        """
+        proc = subprocess.Popen(
+            [str(a) for a in argv], stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
+            cwd=str(workdir) if workdir else None, env=self.env())
+        tail, out = [], []
+
+        def read_err():
+            for raw in iter(proc.stderr.readline, b""):
+                line = raw.decode("utf-8", "replace").rstrip()
+                # ffmpeg prefixes every line with its internal object address,
+                # which means nothing to anyone reading the failure in a chat.
+                line = re.sub(r"\[[^\]]*@ 0x[0-9a-f]+\]\s*", "", line)
+                if line:
+                    tail.append(line)
+                    del tail[:-40]
+                if progress:
+                    found = PROGRESS_RE.search(line)
+                    if found:
+                        progress(int(found.group(1)))
+
+        def read_out():
+            out.append(proc.stdout.read())
+
+        pumps = [threading.Thread(target=fn, daemon=True)
+                 for fn in (read_err, read_out)]
+        for pump in pumps:
+            pump.start()
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            raise TranscribeError("%s gave up after %d minutes"
+                                  % (Path(argv[0]).name, max(1, timeout // 60)))
+        finally:
+            for pump in pumps:
+                pump.join(timeout=10)
+            for pipe in (proc.stdout, proc.stderr):
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
+        if proc.returncode != 0:
+            reason = " / ".join(tail[-3:])
+            raise TranscribeError("%s failed: %s"
+                                  % (Path(argv[0]).name, reason or "no output"))
+        return b"".join(out).decode("utf-8", "replace")
+
+    # -- audio
+
+    def to_wav(self, source, workdir):
+        """16 kHz mono, which is the only thing whisper.cpp listens to."""
+        wav = Path(workdir) / "audio.wav"
+        self.run([self.ffmpeg, "-nostdin", "-y", "-i", str(source), "-vn",
+                  "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(wav)],
+                 timeout=3600)
+        if not wav.is_file() or wav.stat().st_size < 1024:
+            raise TranscribeError("there is no sound in that file")
+        return wav
+
+    def whisper_run(self, wav, workdir, progress=None):
+        """Returns (segments, language). Segments are (seconds, text)."""
+        base = Path(workdir) / "out"
+        argv = [self.whisper, "-m", str(self.model), "-f", str(wav),
+                "-l", self.language, "-oj", "-of", str(base), "-pp"]
+        if self.threads:
+            argv += ["-t", str(self.threads)]
+        seconds = wav.stat().st_size / 32000.0        # 16 kHz, 16 bit, mono
+        self.run(argv, timeout=int(seconds * 4) + 600, progress=progress)
+        payload = load_json(str(base) + ".json")
+        if not payload:
+            raise TranscribeError("whisper wrote no transcript")
+        language = ((payload.get("result") or {}).get("language") or "").strip()
+        segments = []
+        for chunk in payload.get("transcription") or []:
+            text = (chunk.get("text") or "").strip()
+            if not text:
+                continue
+            offset = ((chunk.get("offsets") or {}).get("from") or 0) / 1000.0
+            segments.append((offset, text))
+        if not segments:
+            raise TranscribeError("nothing was said in that recording")
+        return segments, language
+
+    def transcribe_audio(self, source, workdir, progress=None):
+        """A media file on disk to (segments, language, seconds)."""
+        if not self.audio_ready():
+            raise TranscribeError("transcription is not set up on this computer")
+        wav = self.to_wav(source, workdir)
+        seconds = wav.stat().st_size / 32000.0
+        if self.max_minutes and seconds > self.max_minutes * 60:
+            raise TranscribeError(
+                "that is %s long, past the %d minute limit"
+                % (hhmmss(seconds), self.max_minutes))
+        segments, language = self.whisper_run(wav, workdir, progress)
+        wav.unlink(missing_ok=True)
+        return segments, language, seconds
+
+    # -- youtube
+
+    def youtube_info(self, url):
+        raw = self.run([self.ytdlp, "-J", "--no-playlist", "--no-warnings",
+                        "--no-progress", url], timeout=300)
+        try:
+            return json.loads(raw)
+        except ValueError:
+            raise TranscribeError("yt-dlp did not describe that video")
+
+    def caption_track(self, info):
+        """Which subtitle track to take, and whether it is an automatic one.
+
+        Manual subtitles are what someone wrote for the video. Automatic ones
+        are only used when the config asks for them, because whisper punctuates
+        better than YouTube's recogniser does.
+        """
+        spoken = (info.get("language") or "").split("-")[0]
+        for auto, tracks in ((False, info.get("subtitles") or {}),
+                             (True, info.get("automatic_captions") or {})):
+            if auto and self.captions != "any":
+                break
+            usable = [k for k in tracks if k != "live_chat" and tracks[k]]
+            if not usable:
+                continue
+            # An "-orig" track is the language actually spoken; everything
+            # else in a long automatic list is machine-translated from it.
+            for candidate in usable:
+                if candidate.endswith("-orig"):
+                    return candidate, auto
+            if spoken:
+                for candidate in usable:
+                    if candidate.split("-")[0] == spoken:
+                        return candidate, auto
+            if not auto:
+                return usable[0], False
+        return None, False
+
+    def youtube_captions(self, url, info, workdir):
+        """(lines, language) from the video's own subtitles, or (None, None)."""
+        if self.captions == "off":
+            return None, None
+        track, auto = self.caption_track(info)
+        if not track:
+            return None, None
+        base = Path(workdir) / "subs"
+        self.run([self.ytdlp, "--skip-download", "--no-playlist",
+                  "--no-warnings", "--no-progress",
+                  "--write-auto-subs" if auto else "--write-subs",
+                  "--sub-langs", track, "--sub-format", "vtt/best",
+                  "--convert-subs", "vtt", "-o", str(base), url], timeout=600)
+        files = sorted(Path(workdir).glob("subs*.vtt"))
+        if not files:
+            return None, None
+        lines = vtt_to_lines(files[0].read_text(encoding="utf-8",
+                                                errors="replace"))
+        if not lines:
+            return None, None
+        return lines, track.split("-")[0]
+
+    def youtube_audio(self, url, workdir, progress=None):
+        base = Path(workdir) / "yt"
+        self.run([self.ytdlp, "--no-playlist", "--no-warnings", "--no-progress",
+                  "-f", "bestaudio/best", "-x", "--audio-format", "wav",
+                  "--postprocessor-args", "ffmpeg:-ac 1 -ar 16000",
+                  "-o", str(base) + ".%(ext)s", url],
+                 timeout=3600, progress=progress)
+        found = sorted(Path(workdir).glob("yt.*"))
+        if not found:
+            raise TranscribeError("the audio would not download")
+        return found[0]
+
+    def transcribe_youtube(self, url, workdir, progress=None):
+        """Returns (segments, language, seconds, info, engine). Captions first."""
+        if not self.ytdlp:
+            raise TranscribeError("yt-dlp is not installed on this computer")
+        info = self.youtube_info(url)
+        seconds = float(info.get("duration") or 0)
+        if self.max_minutes and seconds > self.max_minutes * 60:
+            raise TranscribeError(
+                "that video is %s long, past the %d minute limit"
+                % (hhmmss(seconds), self.max_minutes))
+        lines, language = self.youtube_captions(url, info, workdir)
+        if lines:
+            return ([(None, line) for line in lines], language, seconds, info,
+                    "the video's own captions")
+        if not self.audio_ready():
+            raise TranscribeError(
+                "that video has no subtitles and whisper is not set up here")
+        audio = self.youtube_audio(url, workdir, progress)
+        segments, language, seconds = self.transcribe_audio(
+            audio, workdir, progress)
+        audio.unlink(missing_ok=True)
+        return segments, language, seconds, info, self.engine_label()
+
+
+def transcript_body(segments, meta, timestamps=False):
+    """The markdown file: frontmatter, a heading, then the words."""
+    lines = ["---",
+             "created: %s" % datetime.now().strftime("%Y-%m-%d"),
+             "source: telegram",
+             "type: transcript"]
+    for key in ("title", "language", "duration", "transcribed-with",
+                "url", "channel", "published", "file"):
+        if meta.get(key):
+            lines.append("%s: %s" % (key, json.dumps(str(meta[key]),
+                                                     ensure_ascii=False)))
+    lines += ["tags:", "  - transcript", "---", "", "# %s" % meta["title"], ""]
+    if meta.get("url"):
+        lines += ["Source: %s" % meta["url"], ""]
+    if meta.get("file"):
+        lines += ["[%s](<%s>)" % (meta["file"], meta["file"]), ""]
+    if timestamps and any(at is not None for at, _ in segments):
+        for at, text in segments:
+            stamp = "[%s] " % hhmmss(at) if at is not None else ""
+            lines.append("%s%s" % (stamp, text))
+            lines.append("")
+    else:
+        for para in paragraphs([text for _, text in segments]):
+            lines += [para, ""]
+    return "\n".join(lines) + "\n"
+
+
 # ---------------------------------------------------------------- bot
 
 class Bot:
@@ -908,6 +1425,14 @@ class Bot:
         self.state = load_json(STATE_PATH, {}) or {}
         self.state.setdefault("offset", 0)
         self.state.setdefault("chats", {})
+        # Transcription runs off the poll loop, so state is written from two
+        # threads. Everything that touches it takes this first.
+        self.lock = threading.RLock()
+        # A job cannot outlive the process that started it, so a flag left set
+        # by a restart is a lie that would hide the button for good.
+        for chat in self.state["chats"].values():
+            for record in (chat.get("filed") or {}).values():
+                record.pop("transcribing", None)
 
     def chat_state(self, chat_id):
         cs = self.state["chats"].setdefault(str(chat_id), {})
@@ -924,7 +1449,7 @@ class Bot:
 
     # -- keyboards
 
-    def keyboard(self, current=None):
+    def keyboard(self, current=None, record=None):
         """Every folder, with the one the file is in right now marked."""
         rows, row = [], []
         for dest in self.cfg.destinations:
@@ -935,8 +1460,28 @@ class Bot:
                 row = []
         if row:
             rows.append(row)
+        if self.offers_transcript(record):
+            rows.append([{"text": "📝 Transcribe",
+                          "callback_data": "b:__transcribe"}])
         rows.append([{"text": "🗑 Delete", "callback_data": "b:__delete"}])
         return rows
+
+    def transcribable(self, record):
+        """Whether there are words in this to find, and a way to find them."""
+        if not record:
+            return False
+        if record.get("yt"):
+            return self.cfg.transcribe.youtube_ready()
+        ext = (record.get("ext") or "").lower()
+        if record.get("kind") == "media" or ext in AUDIO_EXT or ext in VIDEO_EXT:
+            return self.cfg.transcribe.audio_ready()
+        return False
+
+    def offers_transcript(self, record):
+        """The button shows until the transcript exists, and not while it runs."""
+        if not record or record.get("transcript") or record.get("transcribing"):
+            return False
+        return self.transcribable(record)
 
     def help_text(self):
         lines = ["<b>%s</b> %s" % (APP.title(), VERSION), "",
@@ -950,6 +1495,25 @@ class Bot:
             mark = "  ← lands here" if dest.key == self.cfg.inbox.key else ""
             lines.append("· %s → <code>%s</code>%s"
                          % (dest.label, dest.path, mark))
+        if self.cfg.transcribe.audio_ready() or \
+                self.cfg.transcribe.youtube_ready():
+            what = []
+            if self.cfg.transcribe.audio_ready():
+                what.append("a voice note, audio or video file")
+            if self.cfg.transcribe.youtube_ready():
+                what.append("a YouTube link")
+            lines += ["", "<b>Transcripts</b>",
+                      "Send %s and the reply offers 📝 Transcribe. Tap it and "
+                      "the words are written as a markdown note in the same "
+                      "folder as the file, and move with it. The language is "
+                      "worked out from the recording, so nothing needs saying "
+                      "in advance." % " or ".join(what)]
+            if self.cfg.transcribe.audio_ready():
+                lines.append("It runs on my computer with whisper.cpp (%s), so "
+                             "nothing is sent anywhere. A long recording takes "
+                             "a few minutes and everything else keeps filing "
+                             "while it runs."
+                             % self.cfg.transcribe.model_name())
         lines += ["", "Names are date plus type, like <code>2026-08-20 1848 "
                       "Image.jpg</code>. A caption overrides that: caption a "
                       "photo <code>contract p3</code> and that is its "
@@ -981,8 +1545,9 @@ class Bot:
                 description="Send anything: photos, files, audio, video, "
                             "links. It is saved to the owner's computer as it "
                             "arrives; tap a folder on the reply to move it "
-                            "there. Answers only while that computer is awake, "
-                            "and only to its owner.")
+                            "there, or 📝 to transcribe a recording. Answers "
+                            "only while that computer is awake, and only to "
+                            "its owner.")
             self.tg.call(
                 "setMyShortDescription",
                 short_description="Files what you send into folders on your "
@@ -1015,12 +1580,15 @@ class Bot:
                 continue
 
             for update in updates:
-                self.state["offset"] = update["update_id"] + 1
-                try:
-                    self.handle(update)
-                except Exception as exc:                  # never kill the loop
-                    log("handler error: %r" % (exc,))
-                self.persist()
+                # One turn of the lock per update. A transcription running on
+                # its own thread writes to the same state file.
+                with self.lock:
+                    self.state["offset"] = update["update_id"] + 1
+                    try:
+                        self.handle(update)
+                    except Exception as exc:              # never kill the loop
+                        log("handler error: %r" % (exc,))
+                    self.persist()
 
     def handle(self, update):
         if "callback_query" in update:
@@ -1077,23 +1645,28 @@ class Bot:
 
         record = restat({"stem": path.stem, "ext": path.suffix,
                          "kind": item["kind"]}, path, inbox.key)
+        if item.get("youtube"):
+            record["yt"] = item["youtube"]
         if item.get("sidecar"):
             try:
-                record["sidecar"] = sidecar_stat(item["sidecar"])
+                add_sidecar(record, item["sidecar"], item.get("sidecar_tail"))
             except OSError:
                 pass
         self.note_history(cs, path, item["kind"], "filed")
         log("filed -> %s" % rel_to(self.cfg.root, path))
         sent = self.tg.send(chat_id, self.filed_text(record),
-                            self.keyboard(inbox.key))
+                            self.keyboard(inbox.key, record))
         remember(cs["filed"], sent.get("message_id"), record)
 
-    def filed_text(self, record, verb="Filed"):
+    def filed_text(self, record, verb="Filed", note=None):
         rel = rel_to(self.cfg.root, record["path"])
         text = "%s\n<code>%s</code>" % (verb, rel)
-        sc = record.get("sidecar")
-        if sc:
+        for sc in sidecars_of(record):
             text += "\n+ <code>%s</code>" % rel_to(self.cfg.root, sc["path"])
+        if note:
+            text += "\n%s" % note
+        elif self.offers_transcript(record):
+            text += "\nTranscribe it?"
         return text
 
     def note_history(self, cs, path, kind, action):
@@ -1153,6 +1726,8 @@ class Bot:
                 chat_id, cs, message_id, None,
                 "I no longer have a record of that file, so I have not touched "
                 "anything. Move it by hand.")
+        if value == "__transcribe":
+            return self.start_transcript(chat_id, cs, message_id, record)
         if value == "__delete":
             return self.remove(chat_id, cs, message_id, record)
         if value in self.cfg.by_key:
@@ -1195,10 +1770,152 @@ class Bot:
         log("deleted -> %s" % rel_to(self.cfg.root, path))
         cs["filed"].pop(str(message_id), None)
         text = "🗑 Deleted <code>%s</code>" % rel_to(self.cfg.root, path)
-        if kept:
+        for note in kept:
             text += ("\nIts note <code>%s</code> has your edits, so it stays."
-                     % rel_to(self.cfg.root, kept))
+                     % rel_to(self.cfg.root, note))
         self.confirm(chat_id, cs, message_id, None, text)
+
+    # -- transcription
+
+    def start_transcript(self, chat_id, cs, message_id, record):
+        """Begin a transcription and hand the chat straight back.
+
+        A button on an older message can still be tapped after the transcript
+        exists, so the offer is checked here and not only when drawing it.
+
+        The work runs on a thread of its own. A talk an hour long takes
+        minutes to transcribe, and nothing else that arrives in the meantime
+        should have to wait behind it.
+        """
+        if not self.offers_transcript(record):
+            return self.confirm(chat_id, cs, message_id, record,
+                                self.filed_text(record))
+        record["transcribing"] = True
+        self.confirm(chat_id, cs, message_id, record,
+                     self.filed_text(record, note="📝 Transcribing…"))
+        threading.Thread(target=self.transcript_job, daemon=True,
+                         args=(chat_id, message_id)).start()
+
+    def live_record(self, chat_id, message_id):
+        """The record as it stands now. It may have moved, or gone."""
+        return (self.chat_state(chat_id).get("filed") or {}).get(str(message_id))
+
+    def transcript_progress(self, chat_id, message_id):
+        """One edit every 20 seconds at most, so a long job still looks alive."""
+        last = [0.0, -1]
+
+        def show(percent):
+            now = time.time()
+            if percent == last[1] or now - last[0] < 20:
+                return
+            last[0], last[1] = now, percent
+            with self.lock:
+                record = self.live_record(chat_id, message_id)
+                if not record:
+                    return
+                text = self.filed_text(
+                    record, note="📝 Transcribing… %d%%" % percent)
+                keyboard = self.keyboard(record["dest"], record)
+            self.tg.edit(chat_id, message_id, text, keyboard)
+
+        return show
+
+    def transcript_job(self, chat_id, message_id):
+        """Off the poll loop: fetch, transcribe, write the note, say so."""
+        with self.lock:
+            record = dict(self.live_record(chat_id, message_id) or {})
+        if not record:
+            return
+        engine = self.cfg.transcribe
+        progress = self.transcript_progress(chat_id, message_id)
+        workdir = STAGING / ("transcript-%s-%d" % (message_id, int(time.time())))
+        try:
+            workdir.mkdir(parents=True, exist_ok=True)
+            if record.get("yt"):
+                segments, language, seconds, info, label = \
+                    engine.transcribe_youtube(record["yt"], workdir, progress)
+                title = (info.get("title") or "").strip()
+                meta = {"title": title or "YouTube transcript",
+                        "url": record["yt"],
+                        "channel": info.get("uploader") or info.get("channel")}
+                stamp = str(info.get("upload_date") or "")
+                if len(stamp) == 8:
+                    meta["published"] = "%s-%s-%s" % (stamp[:4], stamp[4:6],
+                                                      stamp[6:])
+                named_after_source = bool(title)
+            else:
+                source = Path(record["path"])
+                if not source.is_file():
+                    raise TranscribeError(
+                        "that file is not where I left it any more")
+                segments, language, seconds = engine.transcribe_audio(
+                    source, workdir, progress)
+                label = engine.engine_label()
+                meta = {"title": source.stem, "file": source.name}
+                named_after_source = False
+            meta["language"] = language_label(language) or "undetermined"
+            meta["duration"] = hhmmss(seconds) if seconds else ""
+            meta["transcribed-with"] = label
+        except TranscribeError as exc:
+            return self.transcript_failed(chat_id, message_id, str(exc))
+        except Exception as exc:
+            log("transcription failed: %r" % (exc,))
+            return self.transcript_failed(chat_id, message_id,
+                                          "it went wrong: %s" % exc)
+        finally:
+            shutil.rmtree(str(workdir), ignore_errors=True)
+
+        body = transcript_body(segments, meta, engine.timestamps)
+        with self.lock:
+            live = self.live_record(chat_id, message_id)
+            cs = self.chat_state(chat_id)
+            if live:
+                # Wherever the file sits now is where the transcript belongs,
+                # even if a folder was tapped while this was running.
+                directory = Path(live["path"]).parent
+                base = Path(live["path"]).stem
+            else:
+                directory = self.cfg.resolve_dir(self.cfg.inbox, "text", ".md")
+                base = record.get("stem") or "transcript"
+            try:
+                directory.mkdir(parents=True, exist_ok=True)
+                if named_after_source:
+                    stem, tail = clean_name(meta["title"], self.cfg.naming), None
+                else:
+                    stem, tail = "%s transcript" % base, " transcript"
+                path = unique_path(directory, stem, ".md")
+                path.write_text(body, encoding="utf-8")
+            except OSError as exc:
+                return self.transcript_failed(chat_id, message_id,
+                                              "it could not be saved: %s" % exc)
+            log("transcribed (%s) -> %s"
+                % (meta["language"], rel_to(self.cfg.root, path)))
+            self.note_history(cs, path, "text", "filed")
+            if not live:
+                self.persist()
+                return self.tg.send(
+                    chat_id, "📝 Transcript in %s\n<code>%s</code>"
+                    % (meta["language"], rel_to(self.cfg.root, path)))
+            live.pop("transcribing", None)
+            live["transcript"] = True
+            add_sidecar(live, path, tail)
+            text = self.filed_text(
+                live, note="📝 Transcript in %s" % meta["language"])
+            self.confirm(chat_id, cs, message_id, live, text)
+            self.persist()
+
+    def transcript_failed(self, chat_id, message_id, reason):
+        """Put the button back: a failure worth retrying usually is."""
+        log("transcription: %s" % reason)
+        with self.lock:
+            record = self.live_record(chat_id, message_id)
+            if not record:
+                return self.tg.send(chat_id, "Transcription: %s" % reason)
+            record.pop("transcribing", None)
+            self.confirm(chat_id, self.chat_state(chat_id), message_id, record,
+                         self.filed_text(record, note="Not transcribed: %s"
+                                                      % reason))
+            self.persist()
 
     def confirm(self, chat_id, cs, message_id, record, text):
         """Update a message in place, or post a fresh one if it is too old.
@@ -1207,7 +1924,7 @@ class Bot:
         on such a message still fire. Without this fallback the file would move
         and the user would see nothing happen at all.
         """
-        keyboard = self.keyboard(record["dest"]) if record else None
+        keyboard = self.keyboard(record["dest"], record) if record else None
         if message_id and self.tg.edit(chat_id, message_id, text, keyboard):
             return message_id
         sent = self.tg.send(chat_id, text, keyboard)
@@ -2034,6 +2751,17 @@ def cmd_check(args):
     except Exception as exc:
         print("Bot:    unreachable - %s" % exc)
     print("Users:  %s" % ", ".join(str(x) for x in sorted(cfg.allowed)))
+    tr = cfg.transcribe
+    if not tr.enabled:
+        print("Speech: off (transcription.enabled is false)")
+    elif tr.audio_ready():
+        print("Speech: whisper.cpp %s, %s captions for YouTube%s"
+              % (tr.model_name(), tr.captions,
+                 "" if tr.ytdlp else "  (yt-dlp missing, so links are skipped)"))
+    else:
+        print("Speech: unavailable, so the transcribe button will not appear")
+        for gap in tr.missing():
+            print("  needs %s" % gap)
     print("Limits: %.0f MB max, %d blocked extensions"
           % (cfg.max_bytes / 1048576.0, len(cfg.blocked_ext)))
     print("\nDestinations:")

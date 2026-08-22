@@ -55,7 +55,7 @@ render_unit() {
   mkdir -p "$(dirname "$UNIT")"
   sed -e "s|__PYTHON__|$PY|g" -e "s|__SCRIPT__|$SCRIPT|g" \
       -e "s|__DIR__|$HERE|g" -e "s|__LOG__|$LOG|g" \
-      -e "s|__LABEL__|$LABEL|g" "$TMPL" > "$UNIT"
+      -e "s|__LABEL__|$LABEL|g" -e "s|__HOME__|$HOME|g" "$TMPL" > "$UNIT"
   echo "wrote $UNIT"
 }
 
@@ -103,7 +103,8 @@ IN TELEGRAM
   /help        Your folders, how names are made, and the limits
 
   Everything you send is filed on arrival. The buttons on each reply move
-  that file to another folder, or delete it.
+  that file to another folder, or delete it. A voice note, a media file or a
+  YouTube link also gets a Transcribe button; see README.md.
 
 Docs: README.md    Threat model: SECURITY.md
 CHUTE_HELP

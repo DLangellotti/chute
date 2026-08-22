@@ -48,6 +48,9 @@ def make_config(root, **overrides):
              "by_kind": {"media": "Media/Work", "text": "Work/Inbox"}},
             {"label": "🏠 Personal", "path": "Personal/Attachments"},
         ],
+        # Off unless a test asks for it, so what is installed on the machine
+        # running the suite cannot change the answers.
+        "transcription": {"enabled": False},
     }
     data.update(overrides)
     return chute.Config(data)

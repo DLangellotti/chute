@@ -370,19 +370,20 @@ check("image embedded", "![](<Router teardown.jpg>)" in fbody, True)
 frec = {"path": str(fpath), "stem": fpath.stem, "ext": ".jpg",
         "kind": "image", "dest": "inbox", "size": fpath.stat().st_size,
         "mtime": int(fpath.stat().st_mtime),
-        "sidecar": chute.sidecar_stat(fnote)}
+        "sidecars": [chute.sidecar_stat(fnote, "")]}
 fmoved = chute.move_filed(frec, root / "Work", root)
 check("moving the file brings the note",
       (root / "Work/Router teardown.md").is_file(), True)
 check("and the old note is gone", fnote.exists(), False)
 check("record follows the note",
-      frec["sidecar"]["path"], str(root / "Work/Router teardown.md"))
+      chute.sidecars_of(frec)[0]["path"],
+      str(root / "Work/Router teardown.md"))
 
 chute.restat(frec, fmoved, "work")
 chute.delete_filed(frec, root)
 kept = chute.delete_sidecar(frec)
 check("deleting the file deletes an untouched note",
-      (kept, (root / "Work/Router teardown.md").exists()), (None, False))
+      (kept, (root / "Work/Router teardown.md").exists()), ([], False))
 
 edited = {"kind": "document", "staged": staged("g.pdf"), "ext": ".pdf",
           "meta": {"from": "Amit"}, "caption": ""}
@@ -390,15 +391,24 @@ gpath = chute.file_item(edited, root / "Forwards", "briefing", cfg)
 gnote = Path(edited["sidecar"])
 check("non-image gets a link, not an embed",
       "[briefing.pdf](<briefing.pdf>)" in gnote.read_text(), True)
-grec = {"sidecar": chute.sidecar_stat(gnote)}
+grec = {"sidecars": [chute.sidecar_stat(gnote, "")]}
 gnote.write_text(gnote.read_text() + "\nmy own thoughts\n")
 check("an edited note survives the delete",
-      (chute.delete_sidecar(grec), gnote.exists()), (gnote, True))
+      (chute.delete_sidecar(grec), gnote.exists()), ([gnote], True))
 
-lost = {"sidecar": {"path": str(root / "Forwards/never was.md"),
-                    "size": 1, "mtime": 1}}
+lost = {"sidecars": [{"path": str(root / "Forwards/never was.md"),
+                      "size": 1, "mtime": 1}]}
 check("a note removed by hand is let go quietly",
-      chute.delete_sidecar(lost), None)
+      chute.delete_sidecar(lost), [])
+
+section("a record written before 0.4 still carries its note")
+legacy_note = root / "Forwards/legacy.md"
+legacy_note.write_text("old\n")
+legacy = {"sidecar": chute.sidecar_stat(legacy_note)}
+check("the single sidecar is read as a list",
+      [x["path"] for x in chute.sidecars_of(legacy)], [str(legacy_note)])
+check("and deleting still removes it",
+      (chute.delete_sidecar(legacy), legacy_note.exists()), ([], False))
 
 
 

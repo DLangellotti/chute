@@ -6,6 +6,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=__DIR__
+# A user service inherits almost no PATH. Chute finds its optional helpers in
+# the usual folders anyway, but they also look each other up by name.
+Environment=PATH=/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:__HOME__/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 ExecStart=__PYTHON__ __SCRIPT__ run
 Restart=always
 RestartSec=30

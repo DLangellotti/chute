@@ -75,6 +75,39 @@ response stop two copies from fighting over the update queue.
 ceiling the Telegram Bot API imposes on what a bot may download. Chute clamps to
 whichever is lower.
 
+## Transcription
+
+Transcription is the one part of Chute that runs other programs and, for a
+YouTube link, reaches out to a third party. It is worth knowing what that means.
+
+**The speech never leaves the computer.** whisper.cpp runs locally against a
+local model file. No transcription service is involved and no audio is uploaded.
+
+**A YouTube link is fetched by yt-dlp.** That contacts YouTube from your
+address, and downloads what the link points to. Only links you send the bot
+yourself are ever fetched, and only when you tap the button. What is fetched is
+never the text you sent: an eleven character video id is read out of it and a
+canonical `youtube.com/watch?v=` URL is rebuilt around that, so nothing else in
+the message reaches yt-dlp.
+
+**Nothing is passed to a shell.** Every external program is run with an argument
+list, never a command string, so a URL or a filename cannot become a command.
+
+**It only runs on a tap.** Arriving audio is filed and nothing more. A
+transcription starts when you press the button, on a thread of its own, and a
+long one cannot stall the filing of anything else.
+
+**Whisper writes only into the staging folder.** Its temporary audio and JSON
+go there and are removed when the job ends, whether it worked or not. The
+transcript itself is written into the same folder as its file, through the same
+containment and naming rules as everything else.
+
+**Duration is capped.** `transcription.max_minutes` defaults to 240. A longer
+recording is refused rather than left grinding.
+
+**It is optional and it is off when absent.** Missing binaries mean the button
+never appears; `transcription.enabled: false` turns it off with them present.
+
 ## What is not
 
 Chute does not scan file contents. If you send it a malicious PDF, it files a

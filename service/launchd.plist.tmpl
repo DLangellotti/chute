@@ -15,6 +15,15 @@
     <key>WorkingDirectory</key>
     <string>__DIR__</string>
 
+    <!-- launchd hands a job /usr/bin:/bin:/usr/sbin:/sbin and nothing else,
+         so Homebrew is invisible to it. Chute looks in the usual folders
+         itself, but the optional helpers it runs look each other up by name. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:__HOME__/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
     <key>RunAtLoad</key>
     <true/>
 
