@@ -4,8 +4,10 @@
 #
 #   1. Get an api_id and api_hash from https://my.telegram.org (Chute's bot
 #      token is not enough; the server needs an application of its own).
-#   2. TELEGRAM_API_ID=... TELEGRAM_API_HASH=... docker compose \
-#        -f service/telegram-bot-api.yml up -d
+#   2. cp service/env.example service/.env, put your two values in it, then
+#      chmod 600 service/.env. Compose reads it on its own, so the values
+#      never go near your shell history. From this folder:
+#        docker compose -f service/telegram-bot-api.yml up -d
 #   3. ./chute logout          deregisters the bot from Telegram's servers.
 #                              This bars it from them for 10 minutes, so do it
 #                              once the container is already up.
