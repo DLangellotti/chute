@@ -1010,6 +1010,16 @@ MODEL_DIRS = [
 
 PROGRESS_RE = re.compile(r"progress\s*=\s*(\d+)%")
 
+# Whisper writes in the style of whatever it decodes first, and carries that
+# forward as context through the rest of the file. A recording that opens over
+# music, or with a stylised cold open, can set it writing in one unpunctuated
+# lowercase run for an hour. An initial prompt showing ordinary punctuation
+# settles it: on a 50 minute talk this is the difference between 1 full stop
+# and 300. It does not change what language is detected, because that is read
+# from the audio before any decoding happens, and it does not change the words.
+DEFAULT_PROMPT = ("Hello, and welcome. This is a transcript written with full "
+                  "punctuation, commas, and capital letters.")
+
 
 def youtube_url(text):
     """The canonical watch URL for the first YouTube link in some text."""
@@ -1131,6 +1141,8 @@ class Transcriber:
         self.model = self.find_model(data.get("model"))
         self.language = str(data.get("language") or "auto").strip() or "auto"
         self.threads = int(data.get("threads") or 0)
+        prompt = data.get("prompt", DEFAULT_PROMPT)
+        self.prompt = "" if prompt is None else str(prompt)
         self.timestamps = bool(data.get("timestamps"))
         self.max_minutes = int(data.get("max_minutes") or 240)
         captions = str(data.get("youtube_captions") or "manual").lower()
@@ -1292,6 +1304,8 @@ class Transcriber:
         base = Path(workdir) / "out"
         argv = [self.whisper, "-m", str(self.model), "-f", str(wav),
                 "-l", self.language, "-oj", "-of", str(base), "-pp"]
+        if self.prompt:
+            argv += ["--prompt", self.prompt]
         if self.threads:
             argv += ["-t", str(self.threads)]
         seconds = wav.stat().st_size / 32000.0        # 16 kHz, 16 bit, mono
@@ -1421,31 +1435,78 @@ class Transcriber:
         return segments, language, seconds, info, self.engine_label()
 
 
-def transcript_body(segments, meta, timestamps=False):
-    """The markdown file: frontmatter, a heading, then the words."""
-    lines = ["---",
-             "created: %s" % datetime.now().strftime("%Y-%m-%d"),
-             "source: telegram",
-             "type: transcript"]
-    for key in ("title", "language", "duration", "transcribed-with",
-                "url", "channel", "published", "file"):
+# Every filed item has at most one note beside it, and a transcript is added
+# to that note rather than becoming a second one.
+TRANSCRIPT_HEADING = "## Transcript"
+
+
+def transcript_section(segments, meta, timestamps=False):
+    """The transcript as a block to append to the note a file already has."""
+    lines = ["", TRANSCRIPT_HEADING, ""]
+    for key, label in (("title", "Source"), ("channel", "Channel"),
+                       ("published", "Published"), ("language", "Language"),
+                       ("duration", "Length"),
+                       ("transcribed-with", "Transcribed with")):
         if meta.get(key):
-            lines.append("%s: %s" % (key, json.dumps(str(meta[key]),
-                                                     ensure_ascii=False)))
-    lines += ["tags:", "  - transcript", "---", "", "# %s" % meta["title"], ""]
-    if meta.get("url"):
-        lines += ["Source: %s" % meta["url"], ""]
-    if meta.get("file"):
-        lines += ["[%s](<%s>)" % (meta["file"], meta["file"]), ""]
+            lines.append("- %s: %s" % (label, meta[key]))
+    lines.append("")
     if timestamps and any(at is not None for at, _ in segments):
         for at, text in segments:
             stamp = "[%s] " % hhmmss(at) if at is not None else ""
-            lines.append("%s%s" % (stamp, text))
-            lines.append("")
+            lines += ["%s%s" % (stamp, text), ""]
     else:
         for para in paragraphs([text for _, text in segments]):
             lines += [para, ""]
-    return "\n".join(lines) + "\n"
+    return "\n".join(lines)
+
+
+def add_frontmatter(text, fields, tag=None):
+    """Insert keys into a note's YAML frontmatter, if it has any.
+
+    Only ever inserts lines, never rewrites what is already there, so a note
+    edited by hand comes through unharmed. Text with no frontmatter is
+    returned untouched rather than given some.
+    """
+    if not text.startswith("---\n"):
+        return text
+    end = text.find("\n---", 3)
+    if end == -1:
+        return text
+    lines = text[:end].split("\n")
+    if tag:
+        for i, line in enumerate(lines):
+            if line.strip() != "tags:":
+                continue
+            # After the last item already in the list, so the tags a note
+            # arrived with keep the order they were written in.
+            last = i + 1
+            while last < len(lines) and lines[last].lstrip().startswith("- "):
+                last += 1
+            if tag not in [x.strip()[2:].strip() for x in lines[i + 1:last]]:
+                lines.insert(last, "  - %s" % tag)
+            break
+    for key, value in fields:
+        if value:
+            lines.append("%s: %s" % (key, json.dumps(str(value),
+                                                     ensure_ascii=False)))
+    return "\n".join(lines) + text[end:]
+
+
+def transcript_note(filename, meta, section, embed=False):
+    """A note for a file that had none, holding the file link and the words."""
+    lines = ["---",
+             "created: %s" % datetime.now().strftime("%Y-%m-%d"),
+             "source: telegram",
+             "file: %s" % json.dumps(filename, ensure_ascii=False)]
+    for key, value in (("transcript-language", meta.get("language")),
+                       ("transcript-length", meta.get("duration"))):
+        if value:
+            lines.append("%s: %s" % (key, json.dumps(str(value),
+                                                     ensure_ascii=False)))
+    lines += ["tags:", "  - inbox", "  - transcript", "---", ""]
+    lines.append(("![](<%s>)" if embed else "[%s](<%s>)")
+                 % ((filename,) if embed else (filename, filename)))
+    return "\n".join(lines) + "\n" + section
 
 
 # ---------------------------------------------------------------- bot
@@ -1874,7 +1935,6 @@ class Bot:
                 if len(stamp) == 8:
                     meta["published"] = "%s-%s-%s" % (stamp[:4], stamp[4:6],
                                                       stamp[6:])
-                named_after_source = bool(title)
             else:
                 source = Path(record["path"])
                 if not source.is_file():
@@ -1883,8 +1943,7 @@ class Bot:
                 segments, language, seconds = engine.transcribe_audio(
                     source, workdir, progress)
                 label = engine.engine_label()
-                meta = {"title": source.stem, "file": source.name}
-                named_after_source = False
+                meta = {"file": source.name}
             meta["language"] = language_label(language) or "undetermined"
             meta["duration"] = hhmmss(seconds) if seconds else ""
             meta["transcribed-with"] = label
@@ -1897,44 +1956,75 @@ class Bot:
         finally:
             shutil.rmtree(str(workdir), ignore_errors=True)
 
-        body = transcript_body(segments, meta, engine.timestamps)
+        section = transcript_section(segments, meta, engine.timestamps)
         with self.lock:
             live = self.live_record(chat_id, message_id)
             cs = self.chat_state(chat_id)
-            if live:
-                # Wherever the file sits now is where the transcript belongs,
-                # even if a folder was tapped while this was running.
-                directory = Path(live["path"]).parent
-                base = Path(live["path"]).stem
-            else:
-                directory = self.cfg.resolve_dir(self.cfg.inbox, "text", ".md")
-                base = record.get("stem") or "transcript"
             try:
-                directory.mkdir(parents=True, exist_ok=True)
-                if named_after_source:
-                    stem, tail = clean_name(meta["title"], self.cfg.naming), None
-                else:
-                    stem, tail = "%s transcript" % base, " transcript"
-                path = unique_path(directory, stem, ".md")
-                path.write_text(body, encoding="utf-8")
+                path, where = self.write_transcript(live or record, section,
+                                                    meta)
             except OSError as exc:
                 return self.transcript_failed(chat_id, message_id,
                                               "it could not be saved: %s" % exc)
             log("transcribed (%s) -> %s"
                 % (meta["language"], rel_to(self.cfg.root, path)))
-            self.note_history(cs, path, "text", "filed")
             if not live:
+                self.note_history(cs, path, "text", "filed")
                 self.persist()
                 return self.tg.send(
                     chat_id, "📝 Transcript in %s\n<code>%s</code>"
                     % (meta["language"], rel_to(self.cfg.root, path)))
             live.pop("transcribing", None)
             live["transcript"] = True
-            add_sidecar(live, path, tail)
+            # The note grew, so whatever record points at it has to be
+            # restated or the 🗑 will refuse it as changed since filing.
+            if where == "self":
+                restat(live, path, live["dest"])
+            elif where == "new":
+                self.note_history(cs, path, "text", "filed")
+                add_sidecar(live, path, "")
+            else:
+                set_sidecars(live, [sidecar_stat(path, "")])
             text = self.filed_text(
                 live, note="📝 Transcript in %s" % meta["language"])
             self.confirm(chat_id, cs, message_id, live, text)
             self.persist()
+
+    def write_transcript(self, record, section, meta):
+        """Put the transcript in the one note this item has, making it if
+        there is none. Returns (path, "self" | "sidecar" | "new").
+
+        One markdown file per thing filed. A link arrives as a note already,
+        so the words go into it. A forwarded recording has a note holding
+        where it came from, so they go in there. A bare recording has none,
+        so one is written.
+        """
+        fields = [("transcript-language", meta.get("language")),
+                  ("transcript-length", meta.get("duration"))]
+        if record.get("kind") == "text":
+            target = Path(record["path"])
+            if target.is_file():
+                body = add_frontmatter(target.read_text(encoding="utf-8"),
+                                       fields, tag="transcript")
+                target.write_text(body + section, encoding="utf-8")
+                return target, "self"
+        notes = sidecars_of(record)
+        if notes:
+            target = Path(notes[0]["path"])
+            if target.is_file():
+                body = add_frontmatter(target.read_text(encoding="utf-8"),
+                                       fields, tag="transcript")
+                target.write_text(body + section, encoding="utf-8")
+                return target, "sidecar"
+        source = Path(record["path"])
+        directory = source.parent
+        directory.mkdir(parents=True, exist_ok=True)
+        target = unique_path(directory, source.stem, ".md")
+        target.write_text(
+            transcript_note(source.name, meta, section,
+                            embed=record.get("kind") == "image"),
+            encoding="utf-8")
+        return target, "new"
 
     def transcript_failed(self, chat_id, message_id, reason):
         """Put the button back: a failure worth retrying usually is."""

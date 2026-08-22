@@ -40,9 +40,11 @@ Chute files only while your computer is awake. Telegram holds what you send for
 ## Transcripts
 
 Send a voice note, an audio or video file, or a YouTube link, and the reply
-carries one more button: 📝 Transcribe. Tap it and the words are written as a
-markdown note in the same folder as the file. Move the file later and the
-transcript goes with it.
+carries one more button: 📝 Transcribe. Tap it and the words are added to the
+note that file already has, or a note is made for it. One markdown file per
+thing you send, never two: a link is already a note, so the words go into it,
+and a forwarded recording's note gains a Transcript section under what was
+already there. Move the file later and its note goes with it.
 
 The language is worked out from the recording, so nothing has to be set in
 advance, and it is recorded in the note's frontmatter along with the duration
@@ -95,6 +97,7 @@ Transcription settings, all optional:
 | `timestamps` | `true` writes `[0:04:12]` against each line |
 | `max_minutes` | refuse anything longer. 240 by default |
 | `youtube_captions` | `manual` (default), `any` to accept YouTube's automatic ones, `off` to always transcribe the audio |
+| `prompt` | The opening line shown to whisper. It writes in the style of what it decodes first and carries that forward, so a recording that opens over music can come out as one unpunctuated lowercase run. The default prompt shows ordinary punctuation and settles it. `""` turns it off |
 | `threads` | passed to whisper.cpp. Its own default otherwise |
 | `whisper_bin`, `ffmpeg_bin`, `ytdlp_bin` | paths, if they are not on `PATH` |
 

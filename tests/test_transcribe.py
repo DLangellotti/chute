@@ -133,28 +133,60 @@ check("auto is not a language", chute.language_label("auto"), "")
 check("duration reads as a clock", chute.hhmmss(3725), "1:02:05")
 
 
-section("the transcript note carries what it came from")
-body = chute.transcript_body(
+section("the transcript is a block, meant to be appended to a note")
+block = chute.transcript_section(
     [(0.0, "First line."), (4.0, "Second line.")],
     {"title": "Root of Trust talk", "language": "Hebrew (he)",
      "duration": "0:42:10", "transcribed-with": "whisper.cpp large-v3-turbo",
-     "url": WATCH, "channel": "Web3 Devs"})
-check("frontmatter opens the file", body.startswith("---\n"), True)
-check("type recorded", "type: transcript" in body, True)
-check("language recorded", 'language: "Hebrew (he)"' in body, True)
-check("duration recorded", 'duration: "0:42:10"' in body, True)
-check("engine recorded", "whisper.cpp large-v3-turbo" in body, True)
-check("source linked", "Source: %s" % WATCH in body, True)
-check("tagged for retrieval", "  - transcript" in body, True)
-check("titled", "# Root of Trust talk" in body, True)
-check("the words are there", "First line. Second line." in body, True)
-check("no timestamps by default", "[0:00:00]" in body, False)
+     "channel": "Web3 Devs", "published": "2026-08-01"})
+check("it opens with a heading, not frontmatter",
+      block.strip().startswith("## Transcript"), True)
+check("source named", "- Source: Root of Trust talk" in block, True)
+check("channel named", "- Channel: Web3 Devs" in block, True)
+check("publish date named", "- Published: 2026-08-01" in block, True)
+check("language named", "- Language: Hebrew (he)" in block, True)
+check("length named", "- Length: 0:42:10" in block, True)
+check("engine named",
+      "- Transcribed with: whisper.cpp large-v3-turbo" in block, True)
+check("the words are there", "First line. Second line." in block, True)
+check("no timestamps by default", "[0:00:00]" in block, False)
+check("a fact nobody supplied is left out", "Published: None" in block, False)
 
-stamped = chute.transcript_body(
+stamped = chute.transcript_section(
     [(0.0, "First line."), (65.0, "Second line.")],
-    {"title": "t", "language": "English (en)"}, timestamps=True)
+    {"language": "English (en)"}, timestamps=True)
 check("timestamps when asked for", "[0:00:00] First line." in stamped, True)
 check("and they count up", "[0:01:05] Second line." in stamped, True)
+
+
+section("frontmatter is added to, never rewritten")
+NOTE = """---
+created: 2026-08-22
+source: telegram
+tags:
+  - inbox
+---
+
+# A note
+
+Body text I typed myself.
+"""
+grown = chute.add_frontmatter(NOTE, [("transcript-language", "Hebrew (he)"),
+                                     ("transcript-length", "0:03:12")],
+                              tag="transcript")
+check("the original keys survive", "created: 2026-08-22" in grown, True)
+check("the body is untouched", "Body text I typed myself." in grown, True)
+check("the new key is inside the frontmatter",
+      grown.index("transcript-language") < grown.index("\n---\n\n# A note"),
+      True)
+check("the tag joined the list", "  - inbox\n  - transcript" in grown, True)
+check("an empty value is skipped",
+      "transcript-length" in chute.add_frontmatter(
+          NOTE, [("transcript-length", "")]), False)
+check("a note with no frontmatter is left exactly as it is",
+      chute.add_frontmatter("just words\n", [("a", "b")]), "just words\n")
+check("so is an unterminated one",
+      chute.add_frontmatter("---\nbroken\n", [("a", "b")]), "---\nbroken\n")
 
 
 section("caption tracks: what is written beats what is guessed")
@@ -282,6 +314,11 @@ def settle():
             thread.join(20)
 
 
+def filed_path(message_id):
+    """Where the bot says it put the thing that message is about."""
+    return Path(bot.chat_state(CHAT)["filed"][str(message_id)]["path"])
+
+
 def keys_of(keyboard):
     return [b["callback_data"] for row in keyboard or [] for b in row]
 
@@ -312,23 +349,27 @@ check("and no prompt either", "Transcribe it?" in sent[-1][0], False)
 cfg.transcribe = FakeEngine()
 
 
-section("tapping it writes the words into the folder the file is in")
+section("a recording with no note gets one, and only one")
 bot.handle(tap(6, "b:__transcribe", voice_msg))
 check("the chat is told at once, before any work",
       "Transcribing" in edits[-1], True)
 settle()
-written = sorted(INBOX.glob("*transcript*.md"))
-check("one transcript appeared", len(written), 1)
-note = written[0].read_text()
-check("named after the recording",
-      written[0].name.endswith(" transcript.md"), True)
+audio = filed_path(voice_msg)
+note_path = audio.with_suffix(".md")
+check("a note appeared, named after the recording", note_path.is_file(), True)
+check("exactly one markdown for that recording",
+      len(list(INBOX.glob(audio.stem + "*.md"))), 1)
+note = note_path.read_text()
 check("the words are in it", "Words from the recording." in note, True)
-check("the language it worked out is recorded",
-      'language: "Hebrew (he)"' in note, True)
-check("it links back to the recording", "Audio.ogg" in note, True)
+check("the language it worked out is in the frontmatter",
+      'transcript-language: "Hebrew (he)"' in note, True)
+check("the length too", 'transcript-length: "0:01:30"' in note, True)
+check("tagged for retrieval", "  - transcript" in note, True)
+check("it links back to the recording", "(<%s>)" % audio.name in note, True)
+check("under one Transcript heading", note.count("## Transcript"), 1)
 check("the reply names the language", "Transcript in Hebrew (he)" in edits[-1],
       True)
-check("and names the file", written[0].name in edits[-1], True)
+check("and names the note", note_path.name in edits[-1], True)
 check("the button is gone once it is done",
       "b:__transcribe" in keys_of(edit_kb[-1]), False)
 check("the engine was handed the filed recording",
@@ -336,11 +377,14 @@ check("the engine was handed the filed recording",
 check("nothing was left in staging", list(chute.STAGING.glob("transcript-*")),
       [])
 
-section("the transcript travels with its recording")
+section("the note travels with its recording")
 bot.handle(tap(7, "b:work", voice_msg))
-check("the recording moved", len(list(WORK.glob("*.ogg"))), 1)
-check("and so did the transcript", len(list(WORK.glob("*transcript*.md"))), 1)
-check("leaving none behind", len(list(INBOX.glob("*transcript*.md"))), 0)
+moved = filed_path(voice_msg)
+check("the recording moved", (moved.parent, moved.parent.name), (WORK, "Work"))
+check("its note came too", moved.with_suffix(".md").is_file(), True)
+check("still one markdown, not two",
+      len(list(WORK.glob(moved.stem + "*.md"))), 1)
+check("and none was left behind", note_path.exists(), False)
 check("both are named on the message", edits[-1].count("Media/Work"), 2)
 
 section("a second tap cannot run it twice")
@@ -348,29 +392,33 @@ before = len(FakeEngine.calls)
 bot.handle(tap(8, "b:__transcribe", voice_msg))
 settle()
 check("the engine was not called again", len(FakeEngine.calls), before)
-check("and no second transcript was written",
-      len(list(WORK.glob("*transcript*.md"))), 1)
+check("and no second markdown was written",
+      len(list(WORK.glob(moved.stem + "*.md"))), 1)
 
-section("a YouTube transcript is named after the video")
+section("a link is already a note, so the words go into that note")
+receipt = filed_path(link_msg)
+before_notes = set(INBOX.glob("*.md"))
 bot.handle(tap(9, "b:__transcribe", link_msg))
 settle()
 check("the engine was given the canonical url",
       FakeEngine.calls[-1], ("youtube", WATCH))
-video = INBOX / "Root of Trust.md"
-check("named after the video, not the note", video.is_file(), True)
-vbody = video.read_text()
-check("the words are in it", "Words from the video." in vbody, True)
-check("the channel is recorded", 'channel: "Web3 Devs"' in vbody, True)
-check("the publish date is recorded", 'published: "2026-08-01"' in vbody, True)
-check("the source url is recorded", WATCH in vbody, True)
+check("no second markdown appeared",
+      sorted(set(INBOX.glob("*.md")) - before_notes), [])
+vbody = receipt.read_text()
+check("the link exactly as it arrived is still there",
+      "https://youtu.be/dQw4w9WgXcQ" in vbody, True)
+check("the words were appended", "Words from the video." in vbody, True)
+check("the video title is named", "- Source: Root of Trust" in vbody, True)
+check("the channel is named", "- Channel: Web3 Devs" in vbody, True)
+check("the publish date is named", "- Published: 2026-08-01" in vbody, True)
 check("captions were credited, not whisper",
       "the video's own captions" in vbody, True)
+check("the language reached the frontmatter",
+      'transcript-language: "English (en)"' in vbody, True)
 bot.handle(tap(10, "b:personal", link_msg))
-moved_to = sorted(root.rglob("Root of Trust.md"))
-check("moving the note brings the transcript, under its own name",
-      [str(x.parent.relative_to(root)) for x in moved_to],
+check("and the one note moves as one file",
+      [str(x.parent.relative_to(root)) for x in root.rglob(receipt.name)],
       ["Personal/Attachments"])
-check("and none is left behind", video.exists(), False)
 
 section("a failure explains itself and offers the button again")
 bot.handle(voice(20))
@@ -384,7 +432,9 @@ check("the button comes back",
 FakeEngine.fail = None
 bot.handle(tap(22, "b:__transcribe", failing))
 settle()
-check("and a retry works", len(list(INBOX.glob("*transcript*.md"))), 1)
+check("and a retry works",
+      "## Transcript" in filed_path(failing).with_suffix(".md").read_text(),
+      True)
 
 section("a recording deleted while it runs still yields its transcript")
 
