@@ -111,6 +111,44 @@ def labels_of(keyboard):
     return [b["text"] for row in keyboard or [] for b in row]
 
 
+section("a message is made safe, and cut to what Telegram accepts")
+check("an ampersand cannot break the parse",
+      chute.tg_escape("Marks & Spencer"), "Marks &amp; Spencer")
+check("nor can a tag someone spoke",
+      chute.tg_escape("a <b> c"), "a &lt;b&gt; c")
+check("ordinary text is left alone", chute.tg_escape("plain"), "plain")
+check("a short message is untouched", chute.tg_fit("short"), "short")
+check("nothing at all is fine", chute.tg_fit(None), "")
+long_one = chute.tg_fit("x" * 9000)
+check("a long one is cut to the limit", len(long_one), chute.TG_LIMIT)
+check("and says that it was", long_one.endswith("…"), True)
+# An entity cut in half fails to parse for a different reason than the one
+# just fixed, so the cut backs up past it.
+check("Telegram counts UTF-16, so an emoji is two", chute.tg_len("\U0001F600"), 2)
+check("and a Hebrew letter is one", chute.tg_len("\u05e9"), 1)
+for label, sample in [("emoji", "\U0001F600" * 3000),
+                    ("Hebrew", "\u05e9\u05dc\u05d5\u05dd " * 2000),
+                    ("both at once", "a\U0001F600" * 3000)]:
+    check("a message of %s is cut by what Telegram counts" % label,
+          chute.tg_len(chute.tg_fit(sample)) <= chute.TG_LIMIT, True)
+check("and is not collapsed to nothing in the process",
+      len(chute.tg_fit("\U0001F600" * 3000)) > 2000, True)
+check("a cut never lands inside an entity",
+      chute.tg_fit("y" * 4093 + "&amp;" + "z" * 50).rstrip("…").endswith("y"),
+      True)
+check("nor inside a tag",
+      "<cod" in chute.tg_fit("y" * 4090 + "<code>xx</code>" + "z" * 50), False)
+
+
+section("a filename with an & in it does not take the reply down")
+# clean_name strips < > and " but has no reason to touch &, so a file called
+# Q&A.mp3 made every reply about it a Telegram parse error.
+check("the ampersand is escaped on the way out",
+      "Q&amp;A" in chute.tg_escape("Inbox/Q&A.mp3"), True)
+check("and the path is otherwise untouched",
+      chute.tg_escape("Inbox/Q&A.mp3"), "Inbox/Q&amp;A.mp3")
+
+
 section("the keyboard is every folder, plus delete")
 first = arrive(photo(1, caption="q3 pricing table"))
 keys = keys_of(sent[-1][1])

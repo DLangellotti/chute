@@ -48,6 +48,7 @@ CLOUD_API = "https://api.telegram.org"
 # to a self-hosted Bot API server is not subject to it: there, getFile hands
 # back a path on disk and nothing is transferred at all.
 CLOUD_CEILING = 20 * 1024 * 1024
+TG_LIMIT = 4096                       # Telegram's hard cap on a message
 POLL_TIMEOUT = 50                     # seconds Telegram holds getUpdates open
 HISTORY_KEEP = 200                    # filings remembered per chat for /history
 HISTORY_SHOW = 15                     # lines /history prints at once
@@ -471,6 +472,55 @@ def load_config(explicit=None):
 
 # ---------------------------------------------------------------- telegram api
 
+def tg_escape(text):
+    """Text made safe to put in a message sent with parse_mode HTML.
+
+    Telegram parses a handful of tags and rejects the whole message if what it
+    is given does not parse. A filename or a summary with an & or a < in it
+    would otherwise take the reply down with it.
+    """
+    return (str(text).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;"))
+
+
+def tg_len(text):
+    """What Telegram counts: an emoji is two of these, a Hebrew letter one."""
+    return len((text or "").encode("utf-16-le")) // 2
+
+
+def tg_fit(text, limit=TG_LIMIT):
+    """A message cut to what Telegram will accept.
+
+    Over the limit the API refuses the whole message, and an edit that fails
+    falls through to a send that raises on a worker thread, after the note is
+    already written. Losing the tail is the smaller harm, and the … says so.
+    """
+    text = text or ""
+    if tg_len(text) <= limit:
+        return text
+    # Telegram counts UTF-16, so the number of characters that fit is not the
+    # number of units. Binary search for the most of them that do.
+    room = limit - 1                      # the … costs a unit of its own
+    low, high = 0, min(len(text), room)
+    while low < high:
+        mid = (low + high + 1) // 2
+        if tg_len(text[:mid]) <= room:
+            low = mid
+        else:
+            high = mid - 1
+    cut = text[:low]
+    # Never stop inside an entity or a tag: half an &amp; or an unclosed
+    # <code> fails to parse for a different reason than the one just fixed.
+    for mark in ("&", "<"):
+        opened = cut.rfind(mark)
+        if opened > -1 and not re.match(r"(&\w{2,6};|<[^<>]{0,40}>)",
+                                        cut[opened:]):
+            cut = cut[:opened]
+    if cut.count("<code>") > cut.count("</code>"):
+        cut += "</code>"
+    return cut.rstrip() + "…"
+
+
 class TelegramConflict(Exception):
     """Another getUpdates consumer is live for this token."""
 
@@ -546,15 +596,16 @@ class Telegram:
         return payload["result"]
 
     def send(self, chat_id, text, keyboard=None):
-        params = {"chat_id": chat_id, "text": text, "parse_mode": "HTML",
-                  "disable_web_page_preview": True}
+        params = {"chat_id": chat_id, "text": tg_fit(text),
+                  "parse_mode": "HTML", "disable_web_page_preview": True}
         if keyboard:
             params["reply_markup"] = {"inline_keyboard": keyboard}
         return self.call("sendMessage", **params)
 
     def edit(self, chat_id, message_id, text, keyboard=None):
-        params = {"chat_id": chat_id, "message_id": message_id, "text": text,
-                  "parse_mode": "HTML", "disable_web_page_preview": True,
+        params = {"chat_id": chat_id, "message_id": message_id,
+                  "text": tg_fit(text), "parse_mode": "HTML",
+                  "disable_web_page_preview": True,
                   "reply_markup": {"inline_keyboard": keyboard or []}}
         try:
             return self.call("editMessageText", **params)
@@ -1876,10 +1927,14 @@ class Bot:
         remember(cs["filed"], sent.get("message_id"), record)
 
     def filed_text(self, record, verb="Filed", note=None):
-        rel = rel_to(self.cfg.root, record["path"])
+        # Escaped because a filename may hold an &: clean_name strips < > and
+        # " but has no reason to touch &, and unescaped it takes the whole
+        # reply down with a parse error.
+        rel = tg_escape(rel_to(self.cfg.root, record["path"]))
         text = "%s\n<code>%s</code>" % (verb, rel)
         for sc in sidecars_of(record):
-            text += "\n+ <code>%s</code>" % rel_to(self.cfg.root, sc["path"])
+            text += "\n+ <code>%s</code>" % tg_escape(
+                rel_to(self.cfg.root, sc["path"]))
         if note:
             text += "\n%s" % note
         elif self.offers_transcript(record):
