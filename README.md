@@ -32,8 +32,7 @@ words go into that file's note. Speech to text runs here, with whisper.cpp:
 the recording never leaves the computer.
 
 Install a diarizer and each speaker is marked. Turn summaries on and each
-transcript gains a headline and bullets — that one sends the words to
-Anthropic, and is off until asked for.
+transcript gains a headline and bullets (optional, requires Anthropic API key).
 
 ## Commands
 
