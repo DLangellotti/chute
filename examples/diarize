@@ -1,0 +1,45 @@
+#!/bin/sh
+# Who is speaking, for Chute's transcription.diarize.
+#
+#   $1  a 16 kHz mono wav, which is what Chute hands every diarizer
+#   $2  where to write the RTTM it reads back
+#
+# Copy this to somewhere on your PATH, chmod +x it, and fetch the two models
+# it names. See "Who is speaking" in the README.
+#
+# sherpa-onnx is about 45 MB of ONNX models with no PyTorch, no account and
+# no token, which is why it is the one documented here. Anything that writes
+# RTTM works: point transcription.diarize_bin at it instead.
+set -e
+
+MODELS="${CHUTE_SHERPA_MODELS:-$HOME/.cache/sherpa}"
+
+exec uvx --quiet --from sherpa-onnx python - "$1" "$2" "$MODELS" <<'PY'
+import array, os, sys, wave, sherpa_onnx
+
+wav_in, rttm_out, models = sys.argv[1], sys.argv[2], sys.argv[3]
+config = sherpa_onnx.OfflineSpeakerDiarizationConfig(
+    segmentation=sherpa_onnx.OfflineSpeakerSegmentationModelConfig(
+        pyannote=sherpa_onnx.OfflineSpeakerSegmentationPyannoteModelConfig(
+            model=models + "/sherpa-onnx-pyannote-segmentation-3-0/model.onnx")),
+    embedding=sherpa_onnx.SpeakerEmbeddingExtractorConfig(
+        model=models + "/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx"),
+    # Chute sets CHUTE_SPEAKERS from transcription.speakers. Zero means it was
+    # not told, and -1 is how sherpa-onnx is asked to work the number out.
+    clustering=sherpa_onnx.FastClusteringConfig(
+        num_clusters=int(os.environ.get("CHUTE_SPEAKERS") or 0) or -1,
+        threshold=0.5),
+    min_duration_on=0.3, min_duration_off=0.5)
+
+# Chute's wav is 16 kHz mono 16-bit PCM, so the standard library reads it and
+# neither librosa nor soundfile has to be installed.
+with wave.open(wav_in) as w:
+    pcm = array.array("h", w.readframes(w.getnframes()))
+audio = [s / 32768.0 for s in pcm]
+
+with open(rttm_out, "w") as fh:
+    for turn in sherpa_onnx.OfflineSpeakerDiarization(config).process(
+            audio).sort_by_start_time():
+        fh.write("SPEAKER x 1 %.3f %.3f <NA> <NA> speaker_%02d <NA> <NA>\n"
+                 % (turn.start, turn.end - turn.start, turn.speaker))
+PY

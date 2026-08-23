@@ -20,6 +20,13 @@ messages sent to that bot and send messages as it. If a token leaks, run
 plain text. Do not commit it. The shipped `.gitignore` already excludes it, along
 with `state.json`, the staging folder and the log.
 
+It is also a list of programs Chute will run. `whisper_bin`, `ffmpeg_bin` and
+`ytdlp_bin` are paths it executes, and `transcription.diarize_args` is a whole
+argv rather than a single path. Nothing there is passed through a shell, and
+nothing in it comes from a Telegram message — only from the file itself. But
+someone who can write `config.json` can already run what they like as you, and
+that was true before diarization existed.
+
 ## Files are written before anyone approves them
 
 This is the change most worth understanding. Chute writes what it receives into
@@ -77,11 +84,13 @@ whichever is lower.
 
 ## Transcription
 
-Transcription is the one part of Chute that runs other programs and, for a
-YouTube link, reaches out to a third party. It is worth knowing what that means.
+Transcription is the part of Chute that runs other programs and, for a YouTube
+link, reaches out to a third party. It is worth knowing what that means.
 
-**The speech never leaves the computer.** whisper.cpp runs locally against a
-local model file. No transcription service is involved and no audio is uploaded.
+**The recording never leaves the computer.** whisper.cpp runs locally against a
+local model file, and a diarizer, if you install one, is another local program
+reading the same audio. No transcription service is involved and no audio is
+uploaded.
 
 **A YouTube link is fetched by yt-dlp.** That contacts YouTube from your
 address, and downloads what the link points to. Only links you send the bot

@@ -44,6 +44,7 @@
     "language": "auto",
     "timestamps": false,
     "max_minutes": 240,
-    "youtube_captions": "manual"
+    "youtube_captions": "manual",
+    "diarize": false
   }
 }

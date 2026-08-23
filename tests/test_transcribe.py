@@ -5,6 +5,8 @@ import re
 import shutil
 import sys
 import tempfile
+import json
+import urllib.error
 import threading
 from pathlib import Path
 
@@ -213,7 +215,8 @@ check("duration reads as a clock", chute.hhmmss(3725), "1:02:05")
 
 section("the transcript is a block, meant to be appended to a note")
 block = chute.transcript_section(
-    [(0.0, "First line."), (4.0, "Second line.")],
+    [chute.Segment(0.0, 3.0, "First line."),
+     chute.Segment(4.0, 7.0, "Second line.")],
     {"title": "Root of Trust talk", "language": "Hebrew (he)",
      "duration": "0:42:10", "transcribed-with": "whisper.cpp large-v3-turbo",
      "channel": "Web3 Devs", "published": "2026-08-01"})
@@ -231,7 +234,8 @@ check("no timestamps by default", "[0:00:00]" in block, False)
 check("a fact nobody supplied is left out", "Published: None" in block, False)
 
 stamped = chute.transcript_section(
-    [(0.0, "First line."), (65.0, "Second line.")],
+    [chute.Segment(0.0, 3.0, "First line."),
+     chute.Segment(65.0, 68.0, "Second line.")],
     {"language": "English (en)"}, timestamps=True)
 check("timestamps when asked for", "[0:00:00] First line." in stamped, True)
 check("and they count up", "[0:01:05] Second line." in stamped, True)
@@ -288,6 +292,205 @@ off = chute.Transcriber({"youtube_captions": "off"})
 check("off means nothing is offered", off.captions, "off")
 
 
+section("RTTM turns are read, and nothing else in the file is")
+RTTM = """SPEAKER talk 1 10.000 5.000 <NA> <NA> spk_1 <NA> <NA>
+SPEAKER talk 1 0.000 4.000 <NA> <NA> spk_0 <NA> <NA>
+SPKR-INFO talk 1 <NA> <NA> <NA> unknown spk_0 <NA> <NA>
+SPEAKER talk 1 20.000 0.000 <NA> <NA> spk_0 <NA> <NA>
+SPEAKER talk 1 not-a-number 1.000 <NA> <NA> spk_0 <NA> <NA>
+SPEAKER talk 1 30.000 2.000 <NA> <NA> <NA> <NA> <NA>
+SPEAKER too short
+"""
+turns = chute.parse_rttm(RTTM)
+check("a turn is its start and its start plus its length",
+      turns[0], (0.0, 4.0, "spk_0"))
+check("out of order in the file, in order out of it",
+      [t[0] for t in turns], [0.0, 10.0])
+check("an SPKR-INFO line is not a turn", len(turns), 2)
+check("nor is one that lasts no time", (20.0, 20.0, "spk_0") in turns, False)
+check("nor one whose numbers are not numbers",
+      [t for t in turns if t[0] == 30.0], [])
+check("empty is empty", chute.parse_rttm(""), [])
+check("so is nothing at all", chute.parse_rttm(None), [])
+check("and a file of noise costs nothing",
+      chute.parse_rttm("!!! ??? \n\x00 nonsense"), [])
+
+
+section("speakers are numbered by who spoke first, not by what they are called")
+check("the later label speaking first is Speaker 1",
+      chute.speaker_names([(0.0, 1.0, "spk_9"), (2.0, 3.0, "spk_0")]),
+      {"spk_9": "Speaker 1", "spk_0": "Speaker 2"})
+check("and the word is not always English",
+      chute.speaker_names([(0.0, 1.0, "spk_0")], "דובר"),
+      {"spk_0": "דובר 1"})
+
+
+section("every line gets the person who said it")
+# spk_0 holds 0-4s, spk_1 holds 10-15s.
+TURNS = chute.parse_rttm(RTTM)
+one = chute.assign_speakers([chute.Segment(1.0, 3.0, "Inside one turn.")], TURNS)
+check("a line inside a turn takes that speaker", one[0].speaker, "Speaker 1")
+check("and stays one line", len(one), 1)
+lopsided = chute.assign_speakers(
+    [chute.Segment(3.6, 13.6, "Nine tenths of this is the second speaker.")],
+    TURNS)
+check("a nine-to-one overlap is not split", len(lopsided), 1)
+check("and goes to whoever held the floor", lopsided[0].speaker, "Speaker 2")
+brief = chute.assign_speakers(
+    [chute.Segment(3.7, 8.0, "A word in edgeways is not a turn.")], TURNS)
+check("a runner-up under a second is a backchannel, not a split", len(brief), 1)
+
+WORDS = "one two three four five six seven eight nine ten"
+straddle = chute.Segment(2.0, 12.0, WORDS)
+split = chute.assign_speakers([straddle], TURNS)
+check("a line across a handover is cut in two", len(split), 2)
+check("the first half is the first speaker", split[0].speaker, "Speaker 1")
+check("the second half is the second", split[1].speaker, "Speaker 2")
+check("and no word is lost", " ".join(s.text for s in split), WORDS)
+
+timed = straddle._replace(
+    words=tuple((2.0 + i, w) for i, w in enumerate(WORDS.split())))
+exact = chute.assign_speakers([timed], TURNS)
+check("word times cut it too", len(exact), 2)
+check("losing nothing either", " ".join(s.text for s in exact), WORDS)
+check("and cutting where the speaker changed", exact[1].text, "nine ten")
+
+check("a line beside a turn joins it",
+      chute.assign_speakers([chute.Segment(15.5, 16.0, "Just after.")],
+                            TURNS)[0].speaker, "Speaker 2")
+check("a line nowhere near one is left unnamed",
+      chute.assign_speakers([chute.Segment(300.0, 301.0, "Alone.")],
+                            TURNS)[0].speaker, None)
+BOTH = [(0.0, 10.0, "spk_0"), (1.0, 4.0, "spk_1")]
+check("two people at once: the one who held the floor longest",
+      chute.assign_speakers([chute.Segment(0.0, 10.0, "Over each other.")],
+                            BOTH)[0].speaker, "Speaker 1")
+check("a caption line has no times and is not touched",
+      chute.assign_speakers([chute.Segment(None, None, "Caption.")],
+                            TURNS)[0].speaker, None)
+plain = [chute.Segment(1.0, 2.0, "Nobody ran a diarizer.")]
+check("no turns at all changes nothing", chute.assign_speakers(plain, []), plain)
+
+
+section("consecutive lines by one person are one block")
+BLOCKS = chute.speaker_blocks([
+    chute.Segment(0, 1, "a", "Speaker 1"),
+    chute.Segment(1, 2, "b", "Speaker 1"),
+    chute.Segment(2, 3, "c", None),
+    chute.Segment(3, 4, "d", "Speaker 2")])
+check("three lines, two blocks", [(who, len(x)) for who, x in BLOCKS],
+      [("Speaker 1", 3), ("Speaker 2", 1)])
+check("an unnamed line stays in the block it is in",
+      BLOCKS[0][1][2].text, "c")
+
+
+section("the note says who is speaking, once there are two of them")
+TWO = [chute.Segment(0.0, 3.0, "First thing said.", "Speaker 1"),
+       chute.Segment(4.0, 7.0, "A reply to it.", "Speaker 2"),
+       chute.Segment(8.0, 9.0, "Still the second.", "Speaker 2"),
+       chute.Segment(10.0, 11.0, "And back again.", "Speaker 1")]
+named = chute.transcript_section(
+    TWO, {"language": "English (en)", "speakers": "2",
+          "diarized-with": "sherpa-onnx"})
+check("the first speaker is marked", "**Speaker 1**" in named, True)
+check("and so is the second", "**Speaker 2**" in named, True)
+check("in the order they spoke",
+      named.index("**Speaker 1**") < named.index("**Speaker 2**"), True)
+check("two lines running are marked once",
+      named.count("**Speaker 2**"), 1)
+check("but coming back is marked again", named.count("**Speaker 1**"), 2)
+check("the count is in the facts", "- Speakers: 2" in named, True)
+check("and so is what found them",
+      "- Speakers found with: sherpa-onnx" in named, True)
+
+stamped_two = chute.transcript_section(TWO, {}, timestamps=True)
+check("names and times together", "**Speaker 2**" in stamped_two, True)
+check("and the times are untouched",
+      "[0:00:04] A reply to it." in stamped_two, True)
+
+# The whole no-regression guarantee, in one line.
+SOLO = [s._replace(speaker="Speaker 1") for s in TWO]
+check("one voice reads exactly as no voice",
+      chute.transcript_section(SOLO, {"language": "English (en)"}),
+      chute.transcript_section([s._replace(speaker=None) for s in SOLO],
+                               {"language": "English (en)"}))
+check("and says nothing about speakers",
+      "Speakers" in chute.transcript_section(SOLO, {}), False)
+
+
+section("a diarizer that is not there costs the transcript nothing")
+d_bin = Path(tempfile.mkdtemp())
+
+
+def diarizer(body):
+    """A stand-in written fresh for each way a diarizer can behave.
+
+    PATH is emptied along with BIN_DIRS, or a real diarizer installed on the
+    machine running the tests is found by name instead of this one.
+    """
+    (d_bin / "diarize").write_text("#!/bin/sh\n%s\n" % body)
+    (d_bin / "diarize").chmod(0o755)
+    dirs, path = chute.BIN_DIRS, os.environ.get("PATH", "")
+    chute.BIN_DIRS = [str(d_bin)]
+    os.environ["PATH"] = "/usr/bin:/bin"
+    try:
+        return chute.Transcriber({"diarize": True})
+    finally:
+        chute.BIN_DIRS, os.environ["PATH"] = dirs, path
+
+
+work = Path(tempfile.mkdtemp())
+wav = work / "audio.wav"
+wav.write_bytes(b"RIFF")
+GOOD = "SPEAKER x 1 0.000 4.000 <NA> <NA> spk_0 <NA> <NA>"
+check("what it writes is read",
+      diarizer("printf '%s\\n' '" + GOOD + "' > \"$2\"").diarize(wav, work, 60),
+      [(0.0, 4.0, "spk_0")])
+check("one that fails is not fatal",
+      diarizer("exit 1").diarize(wav, work, 60), [])
+check("nor one that writes nothing",
+      diarizer("rm -f \"$2\"; exit 0").diarize(wav, work, 60), [])
+check("nor one that writes rubbish",
+      diarizer("echo 'not rttm' > \"$2\"").diarize(wav, work, 60), [])
+# The script writes back whatever number it was handed, as a turn length.
+ECHO_SPEAKERS = ("printf 'SPEAKER x 1 0.000 %s.000 <NA> <NA> s <NA> <NA>\\n' "
+                 "\"$CHUTE_SPEAKERS\" > \"$2\"")
+check("how many people there are reaches it",
+      diarizer(ECHO_SPEAKERS).diarize(wav, work, 60), [])
+sized = diarizer(ECHO_SPEAKERS)
+sized.speakers = 3
+check("and it is the number that was configured",
+      sized.diarize(wav, work, 60), [(0.0, 3.0, "s")])
+check("nothing is marked unless it was asked for",
+      chute.Transcriber({"diarize_bin": str(d_bin / "diarize")}).diarize_ready(),
+      False)
+raises("args with nowhere to write are refused",
+       lambda: chute.Transcriber({"diarize_args": ["{wav}"]}), chute.ConfigError)
+raises("nor with nowhere to read from",
+       lambda: chute.Transcriber({"diarize_args": ["{rttm}"]}), chute.ConfigError)
+raises("and they have to be a list",
+       lambda: chute.Transcriber({"diarize_args": "{wav} {rttm}"}),
+       chute.ConfigError)
+shutil.rmtree(str(d_bin), ignore_errors=True)
+shutil.rmtree(str(work), ignore_errors=True)
+
+
+section("broadcast captions already say who is speaking")
+MARKED = chute.caption_speakers(
+    [">> DAVID: Welcome back.", "We were talking about keys.",
+     ">> ANNA: We were.", ">> And now nobody knows who this is.",
+     "A line with a >> in the middle of it."])
+check("the mark is gone from the words", MARKED[0], ("David", "Welcome back."))
+check("and the name carries on", MARKED[1][0], "David")
+check("until the next one", MARKED[2], ("Anna", "We were."))
+check("a bare mark is a change nobody can name",
+      MARKED[3], (None, "And now nobody knows who this is."))
+check("and a mark mid-sentence is not one",
+      MARKED[4], (None, "A line with a >> in the middle of it."))
+check("ordinary lines come back as they were",
+      chute.caption_speakers(["Just a line."]), [(None, "Just a line.")])
+
+
 # ------------------------------------------------------------------ the flow
 
 sent, edits, edit_kb, mid = [], [], [], [100]
@@ -342,7 +545,7 @@ class FakeEngine:
         if self.fail:
             raise chute.TranscribeError(self.fail)
         progress(50)
-        return [(0.0, "Words from the recording.")], "he", 90.0
+        return [chute.Segment(0.0, 4.0, "Words from the recording.")], "he", 90.0
 
     keep = "video"
 
@@ -355,7 +558,7 @@ class FakeEngine:
             media = Path(workdir) / "yt.mp4"
             media.parent.mkdir(parents=True, exist_ok=True)
             media.write_bytes(b"FAKE VIDEO")
-        return ([(None, "Words from the video.")], "en", 600.0,
+        return ([chute.Segment(None, None, "Words from the video.")], "en", 600.0,
                 {"title": "Root of Trust", "uploader": "Web3 Devs",
                  "upload_date": "20260801"}, "the video's own captions", media)
 
@@ -545,7 +748,7 @@ class VanishingEngine(FakeEngine):
     def transcribe_audio(self, source, workdir, progress=None):
         bot.chat_state(CHAT)["filed"].pop(str(orphan), None)
         Path(source).unlink()
-        return [(0.0, "Said before it went.")], "en", 10.0
+        return [chute.Segment(0.0, 4.0, "Said before it went.")], "en", 10.0
 
 
 bot.handle(voice(30))

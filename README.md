@@ -58,14 +58,16 @@ Root of Trust transcript 2026-08-23 0012.md
 Reckon on 500 MB to 1 GB for an hour at 1080p. Set `transcription.keep` to
 `audio` for the sound alone, or `none` to keep only the words.
 
-The language is worked out from the recording, so nothing has to be set in
-advance, and it is recorded in the note's frontmatter along with the duration
+When more than one person is talking they can each be marked in the note; see
+"Who is speaking" below. The language is worked out from the recording, so
+nothing has to be set in advance, and it is recorded in the note's
+frontmatter along with the duration
 and what produced it. YouTube links use the video's own subtitles when it has
 them, and fall back to transcribing the audio when it does not.
 
-Speech to text runs on your own computer with whisper.cpp. Nothing is uploaded.
-It is optional: without it everything else works the same and the button does
-not appear.
+Speech to text runs on your own computer with whisper.cpp; the recording never
+leaves it. It is optional: without it everything else works the same and the
+button does not appear.
 
 ```
 brew install whisper-cpp ffmpeg yt-dlp
@@ -79,6 +81,80 @@ That model is 574 MB and handles about 100 languages. Any `ggml-*.bin` in
 
 An hour of audio takes a few minutes on an Apple Silicon Mac, and the bot keeps
 filing everything else while it runs.
+
+## Who is speaking
+
+A conversation comes out as one wall of text, because whisper hears words and
+not people. Install a diarizer and each of them is marked instead:
+
+```markdown
+**Speaker 1**
+
+So the question everyone asks first is where the key lives. And the honest
+answer is that it lives in three places at once, which is the whole problem.
+
+**Speaker 2**
+
+Right, but that's a design choice, not a law of physics. You could put it in
+one place.
+```
+
+Chute does not do this itself. It runs a command you name, hands it the audio,
+and reads back an RTTM file, which is the one format every diarizer writes. So
+the choice stays yours, and the recommended one is sherpa-onnx: about 45 MB of
+models, no PyTorch and no account anywhere.
+
+`examples/diarize` is a working wrapper for it. Put it on your PATH:
+
+```sh
+install -m 755 examples/diarize ~/.local/bin/diarize
+```
+
+fetch the two models it names, once:
+
+```sh
+mkdir -p ~/.cache/sherpa && cd ~/.cache/sherpa
+curl -LO https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2
+tar xf sherpa-onnx-pyannote-segmentation-3-0.tar.bz2
+curl -LO https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx
+```
+
+and turn it on:
+
+```json
+"transcription": { "diarize": true, "diarize_label": "sherpa-onnx" }
+```
+
+`./chute check` then names it, or says what is missing. It adds roughly a third
+again to the wait, and the recording still never leaves the computer: `uv`
+fetches the package and the models once, and nothing after that is online.
+
+Speakers are numbered by who talks first, so Speaker 1 is whoever opened. They
+are not names, and cannot be: a diarizer tells voices apart without knowing
+whose they are, and the same person is speaker 1 in one recording and 2 in the
+next. The note is a markdown file, so `**Speaker 1**` to `**David**` is one
+replace-all in your editor, correct for that recording and no other.
+
+Say `"speakers": 2` when you know how many people there are and it is both
+quicker and more accurate. It reaches the diarizer as the environment variable
+`CHUTE_SPEAKERS`, so a wrapper of your own has to read it — `examples/diarize`
+shows how. `0` means nobody said, and the diarizer works the number out. Set
+`"speaker_label"` to change the word itself.
+
+Two things it will not do. A YouTube video with subtitles of its own is not
+diarized, because Chute uses those subtitles rather than the audio; set
+`"youtube_captions": "off"` to transcribe and diarize the sound instead. And
+one voice is never marked, because a name written once at the top and never
+again says nothing.
+
+The exception is captions written by a person. Broadcast subtitles carry
+`>> NAME:` at each change of speaker, and where they do those names are used
+verbatim, with no diarizer installed at all — they are the only attribution
+anybody can vouch for.
+
+If you would rather have pyannote, whose accuracy is the one to beat, the
+wrapper is the same shape. It wants a HuggingFace token, the model's terms
+accepted on their website, and about 2 GB of PyTorch.
 
 ## Bigger files
 
@@ -135,5 +211,11 @@ Transcription settings, all optional:
 | `prompt` | The opening line shown to whisper. It writes in the style of what it decodes first and carries that forward, so a recording that opens over music can come out as one unpunctuated lowercase run. The default prompt shows ordinary punctuation and settles it. `""` turns it off |
 | `threads` | passed to whisper.cpp. Its own default otherwise |
 | `whisper_bin`, `ffmpeg_bin`, `ytdlp_bin` | paths, if they are not on `PATH` |
+| `diarize` | `false`. `true` marks each speaker. See "Who is speaking" |
+| `diarize_bin` | the diarizer to run. `diarize` by default |
+| `diarize_args` | what to run it with. `["{wav}", "{rttm}"]` by default: the audio in, the answer out |
+| `diarize_label` | what the note credits, like `sherpa-onnx`. The command's own name otherwise |
+| `speakers` | how many people, when you know. `0` leaves it to be worked out |
+| `speaker_label` | `Speaker` by default, so lines read `Speaker 1`. Set it to `דובר` or `Sprecher` and they read in that language |
 
 [SECURITY.md](SECURITY.md) covers the threat model. MIT licensed.

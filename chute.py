@@ -4,11 +4,12 @@ Chute - send a file to a Telegram bot, it lands in the right folder.
 
 Point it at any folder tree: an Obsidian vault, a Logseq graph, a NAS share, a
 plain Downloads folder. Send the bot anything Telegram carries: photos, any
-file, audio, video, links, forwarded messages. It lands in your Inbox folder as it
-arrives, named by date and type or by your caption, and the buttons on the
-reply move it. Send audio, video or a YouTube link and it offers to transcribe
-it too, locally with whisper.cpp. Polling only, so it works behind NAT with no
-public URL.
+file, audio, video, links, forwarded messages. It lands in your Inbox folder
+as it arrives, named by date and type or by your caption, and the buttons on
+the reply move it. Send audio, video or a YouTube link and it offers to
+transcribe it too, locally with whisper.cpp, marking each speaker if a
+diarizer is installed. Polling only, so it works behind NAT with no public
+URL.
 
     chute.py setup     one-time: bot token, root folder, destinations
     chute.py run       long-poll Telegram and file what arrives
@@ -18,6 +19,7 @@ public URL.
 Python 3.9+, standard library only. No dependencies.
 """
 
+import collections
 import json
 import os
 import re
@@ -1167,6 +1169,32 @@ def language_label(code):
     return "%s (%s)" % (name, short) if name else short
 
 
+# A line of transcript and everything known about it. Speaker is None until a
+# diarizer says otherwise, and words is empty unless whisper was asked for the
+# token detail that splitting a line at a change of speaker needs. One type
+# rather than a tuple that would have to grow three times, and every place that
+# unpacks it break three times with it.
+Segment = collections.namedtuple(
+    "Segment", "start end text speaker words", defaults=(None, ()))
+
+
+def whisper_words(chunk):
+    """Token times out of one line of whisper.cpp's -ojf JSON.
+
+    Only there to say where inside a line a word starts, so a line spoken by
+    two people can be cut between them rather than guessed at. Whisper's own
+    special tokens carry no text anyone said and are dropped.
+    """
+    words = []
+    for token in chunk.get("tokens") or []:
+        text = token.get("text") or ""
+        if not text.strip() or text.startswith("[_"):
+            continue
+        at = ((token.get("offsets") or {}).get("from") or 0) / 1000.0
+        words.append((at, text))
+    return tuple(words)
+
+
 def hhmmss(seconds):
     seconds = int(seconds or 0)
     return "%d:%02d:%02d" % (seconds // 3600, seconds % 3600 // 60, seconds % 60)
@@ -1189,6 +1217,262 @@ def paragraphs(sentences, width=600):
             buf = ""
     if buf:
         out.append(buf)
+    return out
+
+
+# Whisper decides where a line ends by punctuation and pauses; a diarizer
+# decides where a turn ends by who is making the sound. The two models are
+# looking at the same audio and still disagree by tenths of a second, so the
+# merge below works in shares of a line rather than in "first turn wins".
+SPLIT_MIN_SECONDS = 1.0   # a shorter runner-up is a backchannel, not a turn
+DOMINANT_SHARE = 0.75     # one speaker holding this much of a line owns it all
+ORPHAN_WINDOW = 2.0       # a line further than this from a turn belongs to nobody
+
+
+def parse_rttm(raw):
+    """Speaker turns out of an RTTM file: [(start, end, label)], in time order.
+
+    RTTM is the one format every diarizer writes, and none of them writes it
+    quite the same way, so only the SPEAKER lines are read and only three of
+    their ten columns. Anything malformed is skipped rather than raised: a
+    diarizer that writes something unexpected must cost the transcript nothing.
+    """
+    turns = []
+    for line in (raw or "").splitlines():
+        fields = line.split()
+        if len(fields) < 8 or fields[0] != "SPEAKER":
+            continue
+        label = fields[7]
+        if not label or label == "<NA>":
+            continue
+        try:
+            start, length = float(fields[3]), float(fields[4])
+        except ValueError:
+            continue
+        if length <= 0:
+            continue
+        turns.append((start, start + length, label))
+    turns.sort(key=lambda t: (t[0], t[1]))
+    return turns
+
+
+def speaker_names(turns, label="Speaker"):
+    """RTTM labels to what a reader sees, numbered by who spoke first.
+
+    A diarizer's own numbering is arbitrary and per-recording: its SPEAKER_00
+    is not necessarily the first voice, and is a different person in the next
+    file. Someone opening the note expects Speaker 1 to be whoever started.
+    """
+    names = {}
+    for _, _, who in turns:
+        if who not in names:
+            names[who] = "%s %d" % (label, len(names) + 1)
+    return names
+
+
+def split_text_at(text, fraction):
+    """Cut a line in two at the word boundary nearest a point through it.
+
+    The fallback for when there are no word times. Speech rate is near enough
+    constant inside one whisper line for a cut by character count to land
+    within a word or so of the right place.
+    """
+    text = text.strip()
+    target = max(1, min(len(text) - 1, int(round(len(text) * fraction))))
+    before = text.rfind(" ", 0, target)
+    after = text.find(" ", target)
+    if before == -1 and after == -1:
+        return text, ""
+    if before == -1:
+        cut = after
+    elif after == -1:
+        cut = before
+    else:
+        cut = before if target - before <= after - target else after
+    return text[:cut].strip(), text[cut:].strip()
+
+
+def overlap(a_start, a_end, b_start, b_end):
+    """Seconds two stretches of time have in common, or zero."""
+    return max(0.0, min(a_end, b_end) - max(a_start, b_start))
+
+
+def assign_speakers(segments, turns, label="Speaker"):
+    """Put a name on every line of the transcript.
+
+    A line that runs across a handover is cut in two, or one person is
+    credited with the other's words. With no turns at all this returns what it
+    was given, which is what makes a missing diarizer cost nothing.
+    """
+    if not turns:
+        return list(segments)
+    names = speaker_names(turns, label)
+    out = []
+    for seg in segments:
+        # Caption lines have no times, so they never reach the arithmetic.
+        if seg.start is None:
+            out.append(seg)
+            continue
+        start = seg.start
+        end = max(seg.end if seg.end is not None else start, start + 0.01)
+        shares = {}
+        for turn_start, turn_end, who in turns:
+            if turn_start >= end:
+                break
+            got = overlap(start, end, turn_start, turn_end)
+            if got > 0:
+                shares[who] = shares.get(who, 0.0) + got
+        ranked = sorted(shares.items(), key=lambda kv: kv[1], reverse=True)
+
+        if not ranked:
+            # Whisper writes lines over music and silence too. One near a turn
+            # is the same person either side of a breath; one a minute from
+            # anybody speaking should not be put in someone's mouth.
+            gap, nearest = None, None
+            for turn_start, turn_end, who in turns:
+                away = max(turn_start - end, start - turn_end, 0.0)
+                if gap is None or away < gap:
+                    gap, nearest = away, who
+            near = gap is not None and gap <= ORPHAN_WINDOW
+            out.append(seg._replace(speaker=names[nearest] if near else None))
+            continue
+
+        best, best_share = ranked[0]
+        runner_up = ranked[1][1] if len(ranked) > 1 else 0.0
+        if (len(ranked) == 1 or runner_up < SPLIT_MIN_SECONDS
+                or best_share / (end - start) >= DOMINANT_SHARE):
+            # The common case, and it must not be clever. Two people at once
+            # lands here too: whisper wrote one line, so one name goes on it,
+            # and it goes to whoever held the floor longest.
+            out.append(seg._replace(speaker=names[best]))
+            continue
+
+        pieces = split_segment(seg, start, end, turns, names)
+        out.extend(pieces if pieces else [seg._replace(speaker=names[best])])
+    return out
+
+
+def split_segment(seg, start, end, turns, names):
+    """One line spoken by two people, cut at the handovers inside it."""
+    cuts = sorted({t for turn_start, turn_end, _ in turns
+                   for t in (turn_start, turn_end) if start < t < end})
+    if not cuts:
+        return []
+    bounds = [start] + cuts + [end]
+    pieces = []
+    for i in range(len(bounds) - 1):
+        piece_start, piece_end = bounds[i], bounds[i + 1]
+        if piece_end - piece_start <= 0:
+            continue
+        who, held = None, 0.0
+        for turn_start, turn_end, name in turns:
+            got = overlap(piece_start, piece_end, turn_start, turn_end)
+            if got > held:
+                who, held = name, got
+        if who is None:
+            # A pause between two turns, landing mid-line. Somebody said these
+            # words; the nearest turn is the best guess as to which of them.
+            gap = None
+            for turn_start, turn_end, name in turns:
+                away = max(turn_start - piece_end, piece_start - turn_end, 0.0)
+                if gap is None or away < gap:
+                    gap, who = away, name
+        pieces.append([piece_start, piece_end, names.get(who)])
+
+    if len(pieces) < 2:
+        return []
+    # Neighbouring pieces the same person holds are one piece again, so a turn
+    # boundary that only clipped the edge of a line does not chop it up.
+    merged = [pieces[0]]
+    for piece in pieces[1:]:
+        if piece[2] == merged[-1][2]:
+            merged[-1][1] = piece[1]
+        else:
+            merged.append(piece)
+    if len(merged) < 2:
+        return []
+
+    texts = cut_text(seg, [(p[0], p[1]) for p in merged], start, end)
+    out = []
+    for piece, (text, words) in zip(merged, texts):
+        if not text:
+            return []          # a split that loses a side is worse than none
+        out.append(Segment(piece[0], piece[1], text, piece[2], words))
+    return out
+
+
+def cut_text(seg, spans, start, end):
+    """The words of a line handed out to the stretches of time it spans."""
+    if seg.words:
+        out = []
+        for span_start, span_end in spans:
+            taken = [w for w in seg.words if span_start <= w[0] < span_end]
+            out.append((" ".join(t.strip() for _, t in taken).strip(),
+                        tuple(taken)))
+        # Anything before the first span or after the last (whisper's token
+        # times drift a little past its own line) goes to the nearest end.
+        early = [w for w in seg.words if w[0] < spans[0][0]]
+        late = [w for w in seg.words if w[0] >= spans[-1][1]]
+        if early:
+            out[0] = ((" ".join(t.strip() for _, t in early) + " "
+                       + out[0][0]).strip(), tuple(early) + out[0][1])
+        if late:
+            out[-1] = ((out[-1][0] + " "
+                        + " ".join(t.strip() for _, t in late)).strip(),
+                       out[-1][1] + tuple(late))
+        return out
+    # No token times, so cut by how far through the line each boundary falls.
+    # Each share is measured against what is left rather than the whole, since
+    # the text shrinks as pieces are taken off the front of it.
+    out, rest, at = [], seg.text, start
+    for _, span_end in spans[:-1]:
+        left = end - at
+        share = (span_end - at) / left if left > 0 else 0.5
+        taken, rest = split_text_at(rest, min(1.0, max(0.0, share)))
+        out.append((taken, ()))
+        at = span_end
+    out.append((rest.strip(), ()))
+    return out
+
+
+def speaker_blocks(segments):
+    """Consecutive lines by the same person: [(name, [segments])].
+
+    A line nobody was named for keeps the block it is in rather than opening a
+    nameless one. An unattributed interjection mid-turn is almost always still
+    the same person, and a named / unlabelled / named sandwich reads as broken.
+    """
+    blocks = []
+    for seg in segments:
+        if blocks and (seg.speaker is None or seg.speaker == blocks[-1][0]):
+            blocks[-1][1].append(seg)
+            continue
+        blocks.append((seg.speaker, [seg]))
+    return blocks
+
+
+# Captioners write ">>" for a change of speaker and ">> NAME:" when they know
+# who it is. Left alone those marks land in the note as punctuation.
+CAPTION_SPEAKER_RE = re.compile(r"^>>+\s*(?:([^:>]{1,40}):)?\s*(.*)$")
+
+
+def caption_speakers(lines):
+    """(speaker, text) out of the >> marks broadcast captions carry.
+
+    The best attribution Chute will ever have, because a person did it. A
+    named mark sets who is talking until the next one; a bare ">>" says only
+    that somebody else started, which is a change Chute cannot put a name to.
+    """
+    out, who = [], None
+    for line in lines:
+        found = CAPTION_SPEAKER_RE.match(line)
+        if found:
+            name, rest = found.group(1), found.group(2).strip()
+            who = " ".join(w.capitalize() for w in name.split()) if name else None
+            if not rest:
+                continue
+            line = rest
+        out.append((who, line))
     return out
 
 
@@ -1295,6 +1579,26 @@ class Transcriber:
                 "transcription.youtube_captions must be manual, any or off, "
                 "got %r" % data.get("youtube_captions"))
         self.captions = captions
+        self.diarize_on = data.get("diarize", False) is True
+        self.diarizer = which_or_path(data.get("diarize_bin") or "diarize")
+        args = data.get("diarize_args") or ["{wav}", "{rttm}"]
+        if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+            raise ConfigError(
+                "transcription.diarize_args must be a list of strings, got %r"
+                % (data.get("diarize_args"),))
+        joined = " ".join(args)
+        for slot in ("{wav}", "{rttm}"):
+            if slot not in joined:
+                raise ConfigError(
+                    "transcription.diarize_args has to say %s somewhere, or "
+                    "there is nowhere to %s" % (slot, "put the audio"
+                                                if slot == "{wav}"
+                                                else "read the answer"))
+        self.diarize_args = args
+        self.diarize_name = str(data.get("diarize_label") or "").strip()
+        self.speakers = int(data.get("speakers") or 0)
+        self.speaker_label = (str(data.get("speaker_label")
+                                  or "Speaker").strip() or "Speaker")
 
     @staticmethod
     def find_model(configured):
@@ -1345,6 +1649,25 @@ class Transcriber:
     def audio_ready(self):
         return bool(self.enabled and self.whisper and self.model and self.ffmpeg)
 
+    def diarize_ready(self):
+        return bool(self.enabled and self.diarize_on and self.diarizer)
+
+    def diarize_label(self):
+        return self.diarize_name or (self.diarizer.name if self.diarizer
+                                     else "a diarizer")
+
+    def diarize_missing(self):
+        """What stands between asking for names and getting them.
+
+        Kept apart from missing(), which is only ever read to explain why the
+        transcribe button is absent. A diarizer nobody installed must never
+        make a transcript look unavailable.
+        """
+        if not self.diarize_on or self.diarizer:
+            return []
+        return ["a diarizer that writes RTTM. See \"Who is speaking\" in the "
+                "README"]
+
     def youtube_ready(self):
         if not (self.enabled and self.ytdlp):
             return False
@@ -1367,7 +1690,7 @@ class Transcriber:
 
     # -- running things
 
-    def run(self, argv, timeout, workdir=None, progress=None):
+    def run(self, argv, timeout, workdir=None, progress=None, extra_env=None):
         """Run a command, returning its stdout.
 
         Both pipes are drained by threads of their own rather than by
@@ -1375,10 +1698,12 @@ class Transcriber:
         arrives: that is where whisper reports how far through it is, and a
         pipe nobody empties fills up and stops the program that is writing it.
         """
+        env = self.env()
+        env.update(extra_env or {})
         proc = subprocess.Popen(
             [str(a) for a in argv], stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
-            cwd=str(workdir) if workdir else None, env=self.env())
+            cwd=str(workdir) if workdir else None, env=env)
         tail, out = [], []
 
         def read_err():
@@ -1440,10 +1765,15 @@ class Transcriber:
         return wav
 
     def whisper_run(self, wav, workdir, progress=None):
-        """Returns (segments, language). Segments are (seconds, text)."""
+        """Returns (segments, language) as Segment records without a speaker."""
         base = Path(workdir) / "out"
         argv = [self.whisper, "-m", str(self.model), "-f", str(wav),
                 "-l", self.language, "-oj", "-of", str(base), "-pp"]
+        # Token times are only wanted for cutting a line at a change of
+        # speaker. They roughly triple the JSON, so an undiarized run asks for
+        # exactly what it always asked for.
+        if self.diarize_ready():
+            argv.append("-ojf")
         if self.prompt:
             argv += ["--prompt", self.prompt]
         if self.threads:
@@ -1454,16 +1784,57 @@ class Transcriber:
         if not payload:
             raise TranscribeError("whisper wrote no transcript")
         language = ((payload.get("result") or {}).get("language") or "").strip()
+        chunks = payload.get("transcription") or []
         segments = []
-        for chunk in payload.get("transcription") or []:
+        for i, chunk in enumerate(chunks):
             text = (chunk.get("text") or "").strip()
             if not text:
                 continue
-            offset = ((chunk.get("offsets") or {}).get("from") or 0) / 1000.0
-            segments.append((offset, text))
+            offsets = chunk.get("offsets") or {}
+            start = (offsets.get("from") or 0) / 1000.0
+            end = (offsets.get("to") or 0) / 1000.0
+            if end <= start:
+                # A line with no length wins no overlap against any turn and
+                # so would be left unnamed. Borrow the next line's start, and
+                # failing that give it a hair's width of its own.
+                nxt = chunks[i + 1] if i + 1 < len(chunks) else {}
+                after = ((nxt.get("offsets") or {}).get("from") or 0) / 1000.0
+                end = after if after > start else start + 0.01
+            segments.append(Segment(start, end, text,
+                                    words=whisper_words(chunk)))
         if not segments:
             raise TranscribeError("nothing was said in that recording")
         return segments, language
+
+    def diarize(self, wav, workdir, seconds):
+        """Who spoke when, as [(start, end, label)]. Never raises.
+
+        A transcript with nobody's name on it is still the transcript.
+        Everything that can go wrong in here - no diarizer, one that dies, one
+        that writes nothing, one that writes something that is not RTTM - is
+        logged, and the words are written exactly as they always were.
+        """
+        if not self.diarize_ready():
+            return []
+        rttm = Path(workdir) / "speakers.rttm"
+        argv = [self.diarizer] + [
+            a.replace("{wav}", str(wav)).replace("{rttm}", str(rttm))
+            for a in self.diarize_args]
+        try:
+            # Generous, because a diarizer is slower than nothing and faster
+            # than whisper, but bounded, so a stuck one cannot hold the job
+            # open for ever.
+            self.run(argv, timeout=min(int(seconds * 2) + 600, 14400),
+                     workdir=workdir,
+                     extra_env={"CHUTE_SPEAKERS": str(self.speakers)})
+            turns = parse_rttm(rttm.read_text(encoding="utf-8",
+                                              errors="replace"))
+        except (TranscribeError, OSError, ValueError) as exc:
+            log("diarization skipped: %s" % exc)
+            return []
+        if not turns:
+            log("diarization found nobody")
+        return turns
 
     def transcribe_audio(self, source, workdir, progress=None):
         """A media file on disk to (segments, language, seconds)."""
@@ -1476,6 +1847,14 @@ class Transcriber:
                 "that is %s long, past the %d minute limit"
                 % (hhmmss(seconds), self.max_minutes))
         segments, language = self.whisper_run(wav, workdir, progress)
+        if self.diarize_ready():
+            # The diarizer wants the same wav whisper just read, so it is only
+            # thrown away below rather than above.
+            if progress:
+                progress("Finding the speakers")
+            segments = assign_speakers(
+                segments, self.diarize(wav, workdir, seconds),
+                self.speaker_label)
         wav.unlink(missing_ok=True)
         return segments, language, seconds
 
@@ -1585,8 +1964,12 @@ class Transcriber:
             # the video is a separate wish from how the words were got.
             media = (self.youtube_media(url, workdir, progress)
                      if self.keep != "none" else None)
-            return ([(None, line) for line in lines], language, seconds, info,
-                    "the video's own captions", media)
+            spoken = caption_speakers(lines)
+            engine = "the video's own captions"
+            if any(who for who, _ in spoken):
+                engine += ", which say who is speaking"
+            return ([Segment(None, None, text, who) for who, text in spoken],
+                    language, seconds, info, engine, media)
         if not self.audio_ready():
             raise TranscribeError(
                 "that video has no subtitles and whisper is not set up here")
@@ -1614,23 +1997,41 @@ def transcript_stem(base, now=None):
     return "%s transcript %s" % (base, now.strftime("%Y-%m-%d %H%M"))
 
 
+def transcript_body(segments, timestamps):
+    """The words themselves, with or without a time against each line."""
+    lines = []
+    if timestamps and any(s.start is not None for s in segments):
+        for seg in segments:
+            stamp = "[%s] " % hhmmss(seg.start) if seg.start is not None else ""
+            lines += ["%s%s" % (stamp, seg.text), ""]
+    else:
+        for para in paragraphs([s.text for s in segments]):
+            lines += [para, ""]
+    return lines
+
+
 def transcript_section(segments, meta, timestamps=False):
     """The transcript as a block to append to the note a file already has."""
     lines = ["", TRANSCRIPT_HEADING, ""]
     for key, label in (("title", "Source"), ("channel", "Channel"),
                        ("published", "Published"), ("language", "Language"),
-                       ("duration", "Length"),
-                       ("transcribed-with", "Transcribed with")):
+                       ("duration", "Length"), ("speakers", "Speakers"),
+                       ("transcribed-with", "Transcribed with"),
+                       ("diarized-with", "Speakers found with")):
         if meta.get(key):
             lines.append("- %s: %s" % (label, meta[key]))
     lines.append("")
-    if timestamps and any(at is not None for at, _ in segments):
-        for at, text in segments:
-            stamp = "[%s] " % hhmmss(at) if at is not None else ""
-            lines += ["%s%s" % (stamp, text), ""]
-    else:
-        for para in paragraphs([text for _, text in segments]):
-            lines += [para, ""]
+    named = {s.speaker for s in segments if s.speaker}
+    if len(named) < 2:
+        # One voice, or none named, reads exactly as it always did. A name
+        # written once at the top and never again is noise, not information.
+        return "\n".join(lines + transcript_body(segments, timestamps))
+    for who, block in speaker_blocks(segments):
+        if who:
+            lines += ["**%s**" % who, ""]
+        # The name sits on a line of its own so that what is under it is the
+        # same paragraphs, or the same stamped lines, as an undiarized note.
+        lines += transcript_body(block, timestamps)
     return "\n".join(lines)
 
 
@@ -1673,7 +2074,8 @@ def transcript_note(filename, meta, section, embed=False):
              "source: telegram",
              "file: %s" % json.dumps(filename, ensure_ascii=False)]
     for key, value in (("transcript-language", meta.get("language")),
-                       ("transcript-length", meta.get("duration"))):
+                       ("transcript-length", meta.get("duration")),
+                       ("transcript-speakers", meta.get("speakers"))):
         if value:
             lines.append("%s: %s" % (key, json.dumps(str(value),
                                                      ensure_ascii=False)))
@@ -1777,11 +2179,14 @@ class Bot:
                       "worked out from the recording, so nothing needs saying "
                       "in advance." % " or ".join(what)]
             if self.cfg.transcribe.audio_ready():
-                lines.append("It runs on my computer with whisper.cpp (%s), so "
-                             "nothing is sent anywhere. A long recording takes "
-                             "a few minutes and everything else keeps filing "
-                             "while it runs."
+                lines.append("It runs on my computer with whisper.cpp (%s). "
+                             "A long recording takes a few minutes and "
+                             "everything else keeps filing while it runs."
                              % self.cfg.transcribe.model_name())
+                if self.cfg.transcribe.diarize_ready():
+                    lines.append("When more than one person is talking, each "
+                                 "of them is marked in the note.")
+                lines.append("Nothing is sent anywhere.")
         lines += ["", "Names are date plus type, like <code>2026-08-20 1848 "
                       "Image.jpg</code>. A caption overrides that: caption a "
                       "photo <code>contract p3</code> and that is its "
@@ -2078,7 +2483,11 @@ class Bot:
 
         def show(percent):
             now = time.time()
-            if percent == last[1] or now - last[0] < 20:
+            # A stage, rather than a percentage, is a step that happens once
+            # and reports nothing while it runs. It always shows, or the chat
+            # sits at 100% looking hung while the speakers are worked out.
+            stage = isinstance(percent, str)
+            if not stage and (percent == last[1] or now - last[0] < 20):
                 return
             last[0], last[1] = now, percent
             with self.lock:
@@ -2086,7 +2495,8 @@ class Bot:
                 if not record:
                     return
                 text = self.filed_text(
-                    record, note="📝 Transcribing… %d%%" % percent)
+                    record, note="📝 %s…" % percent if stage
+                    else "📝 Transcribing… %d%%" % percent)
                 keyboard = self.keyboard(record["dest"], record)
             self.tg.edit(chat_id, message_id, text, keyboard)
 
@@ -2128,6 +2538,12 @@ class Bot:
             meta["language"] = language_label(language) or "undetermined"
             meta["duration"] = hhmmss(seconds) if seconds else ""
             meta["transcribed-with"] = label
+            names = {s.speaker for s in segments if s.speaker}
+            if len(names) > 1:
+                meta["speakers"] = str(len(names))
+                meta["diarized-with"] = (
+                    "the captions' own speaker marks" if record.get("yt")
+                    and "captions" in label else engine.diarize_label())
         except TranscribeError as exc:
             return self.transcript_failed(chat_id, message_id, str(exc))
         except Exception as exc:
@@ -2209,7 +2625,8 @@ class Bot:
         if kept:
             meta["file"] = kept.name
         fields = [("transcript-language", meta.get("language")),
-                  ("transcript-length", meta.get("duration"))]
+                  ("transcript-length", meta.get("duration")),
+                  ("transcript-speakers", meta.get("speakers"))]
         stem = transcript_stem(base or Path(record["path"]).stem)
 
         def grow(note):
@@ -3108,6 +3525,13 @@ def cmd_check(args):
     else:
         print("Speech: unavailable, so the transcribe button will not appear")
         for gap in tr.missing():
+            print("  needs %s" % gap)
+    # Nothing at all when nobody asked: silence is the default state.
+    if tr.diarize_ready():
+        print("Names:  %s, via %s" % (tr.diarize_label(), tr.diarizer))
+    elif tr.diarize_on:
+        print("Names:  asked for, but nothing will be marked")
+        for gap in tr.diarize_missing():
             print("  needs %s" % gap)
     if cfg.local_api:
         print("Server: %s  (your own, so no 20 MB download limit)"
