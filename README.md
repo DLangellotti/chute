@@ -67,7 +67,8 @@ them, and fall back to transcribing the audio when it does not.
 
 Speech to text runs on your own computer with whisper.cpp; the recording never
 leaves it. It is optional: without it everything else works the same and the
-button does not appear.
+button does not appear. The optional summary below is the one thing Chute sends
+anywhere, and it is off until you turn it on.
 
 ```
 brew install whisper-cpp ffmpeg yt-dlp
@@ -155,6 +156,76 @@ anybody can vouch for.
 If you would rather have pyannote, whose accuracy is the one to beat, the
 wrapper is the same shape. It wants a HuggingFace token, the model's terms
 accepted on their website, and about 2 GB of PyTorch.
+
+## Summaries
+
+Optional, and off. Turn it on and every transcript gains a headline and a few
+bullets: at the top of the note, in its frontmatter, and in the reply in
+Telegram.
+
+```markdown
+## Summary
+
+Two engineers arguing about where a signing key should live.
+
+- Splitting it three ways is the only workable answer, Ganesh says.
+- David counters that one place is a design choice, not a law of physics.
+- They agree the single-location version becomes the whole attack surface.
+
+## Transcript
+```
+
+**This is the only part of Chute that sends anything off your computer.** With
+it on, the full text of every transcript goes over HTTPS to Anthropic's API to
+be summarised, along with the recording's language and length. The audio never
+goes anywhere; the words do. Everything else — filing, transcription, finding
+the speakers — stays on the machine, and this stays off until you type it in:
+
+```json
+"summary": { "enabled": true }
+```
+
+The key goes in the environment, never in `config.json`. Chute refuses to start
+if it finds one there.
+
+```sh
+cp service/env.example service/.env      # if you have not already
+echo 'ANTHROPIC_API_KEY=sk-ant-...' >> service/.env
+chmod 600 service/.env
+```
+
+Chute reads `service/.env` at startup, so this works the same from a terminal,
+under launchd, and under systemd. That indirection is on purpose: launchd has no
+`EnvironmentFile`, and its plist is world readable, so a key carried by the
+service would sit in a worse place than the one file you just locked down.
+`./chute check` says whether the key was found, and says out loud that
+transcripts will be sent.
+
+The summary is written in the language of the recording, so a Hebrew talk gets a
+Hebrew summary. It costs about five to ten cents for an hour of speech at Claude
+Opus 5 rates, and a fraction of a cent for a voice note. Set `model` to
+`claude-haiku-4-5` for roughly a fifth of that, and a summary that is noticeably
+worse at picking out what mattered.
+
+Everything about it fails quietly. No key, no network, an error, a refusal, an
+answer that is not what was asked for: one line in the log, and the transcript is
+written exactly as it would have been anyway.
+
+On a Raspberry Pi or a small VPS this is the only way to get a summary worth
+reading. A model small enough to fit there cannot read an hour of speech, and
+reading a long prompt is precisely what a weak CPU is slowest at. The request
+costs the Pi nothing but the bytes.
+
+| | |
+| --- | --- |
+| `enabled` | `false`. `true` summarises every transcript |
+| `model` | `claude-opus-5` by default |
+| `api_key_env` | which variable holds the key. `ANTHROPIC_API_KEY` by default |
+| `api_key_file` | a file holding the key, if you would rather not use the environment at all |
+| `bullets` | how many points to ask for. 4 by default |
+| `max_chars` | never send more than this much of a transcript. 120000 by default |
+| `timeout` | seconds to wait. 120 by default |
+| `base_url` | for a proxy or a gateway. Must be https, or on this machine |
 
 ## Bigger files
 

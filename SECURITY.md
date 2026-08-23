@@ -27,6 +27,27 @@ nothing in it comes from a Telegram message — only from the file itself. But
 someone who can write `config.json` can already run what they like as you, and
 that was true before diarization existed.
 
+## Summaries send your transcripts to a third party
+
+Off by default, and the one thing in Chute that leaves the machine. With
+`summary.enabled` on, the whole transcript — everything said in the recording,
+including anything private — is sent to `api.anthropic.com` over HTTPS, on
+every transcription, with no second confirmation. What goes is the same block
+that is written into the note: the words, the speaker markings when a diarizer
+found any, and the recording's language and length. The audio is not sent, and
+neither is the filename. It only ever runs after a transcription someone asked
+for.
+
+The key lives in `service/.env`, `chmod 600` and gitignored, never in
+`config.json`; Chute refuses to start if it finds one there. Anyone who can read
+that file can spend against the key, and `/proc/<pid>/environ` exposes it to the
+user running Chute. There is no spend limit in Chute and no rate limiting on the
+button, so put a budget on the key in the Anthropic Console: that is the only
+real cap.
+
+A failure is silent by design. Nothing is retried and nothing is queued, so a
+transcript is never sitting somewhere waiting to be sent.
+
 ## Files are written before anyone approves them
 
 This is the change most worth understanding. Chute writes what it receives into
@@ -90,7 +111,9 @@ link, reaches out to a third party. It is worth knowing what that means.
 **The recording never leaves the computer.** whisper.cpp runs locally against a
 local model file, and a diarizer, if you install one, is another local program
 reading the same audio. No transcription service is involved and no audio is
-uploaded.
+uploaded — and that stays true whether or not summaries are on. The *words* are
+a separate question: see "Summaries send your transcripts to a third party"
+above, which is off unless you turned it on.
 
 **A YouTube link is fetched by yt-dlp.** That contacts YouTube from your
 address, and downloads what the link points to. Only links you send the bot

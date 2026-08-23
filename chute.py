@@ -8,8 +8,9 @@ file, audio, video, links, forwarded messages. It lands in your Inbox folder
 as it arrives, named by date and type or by your caption, and the buttons on
 the reply move it. Send audio, video or a YouTube link and it offers to
 transcribe it too, locally with whisper.cpp, marking each speaker if a
-diarizer is installed. Polling only, so it works behind NAT with no public
-URL.
+diarizer is installed. Summaries are the one optional thing that leaves the
+computer, and they are off unless asked for. Polling only, so it works behind
+NAT with no public URL.
 
     chute.py setup     one-time: bot token, root folder, destinations
     chute.py run       long-poll Telegram and file what arrives
@@ -36,7 +37,7 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 APP = "chute"
 
 HERE = Path(__file__).resolve().parent
@@ -87,6 +88,31 @@ RESERVED_STEMS = {
 
 
 # ---------------------------------------------------------------- small helpers
+
+def load_env_file(path=None):
+    """KEY=value lines from service/.env into the environment.
+
+    launchd has no EnvironmentFile, and its plist is world readable and gets
+    printed by launchctl, so a key carried by the service would be a second
+    copy in a worse place. One chmod 600 file instead, read the same way on a
+    Mac, a Pi and a VPS. Anything already set wins, so a systemd
+    EnvironmentFile or an exported variable still takes precedence.
+    """
+    path = Path(path) if path else HERE / "service" / ".env"
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, _, value = line.partition("=")
+        name = name.strip()
+        value = value.strip().strip('"').strip("'")
+        if name and name not in os.environ:
+            os.environ[name] = value
+
 
 def log(msg):
     line = "%s  %s" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg)
@@ -383,6 +409,7 @@ class Config:
 
         self.text_capture = data.get("text_capture") or {}
         self.transcribe = Transcriber(data.get("transcription"))
+        self.summary = Summariser(data.get("summary"))
         sec = data.get("security") or {}
         self.blocked_ext = set(
             e.lower() if e.startswith(".") else "." + e.lower()
@@ -1982,6 +2009,216 @@ class Transcriber:
         return segments, language, seconds, info, self.engine_label(), media
 
 
+# ---------------------------------------------------------------- summaries
+
+# A summary needs a model too big to run beside the bot, so the words go to
+# Anthropic and come back as a headline and a few bullets. Off unless
+# config.json asks, and the only part of Chute that makes a network call for
+# anything but Telegram.
+SUMMARY_HEADING = "## Summary"
+API_VERSION = "2023-06-01"
+# The scalar form of server-side fallbacks: when a recording trips a safety
+# classifier the same request is re-run on another model rather than coming
+# back empty. Its header and the older list form are not interchangeable.
+FALLBACK_BETA = "server-side-fallback-2026-07-01"
+
+SUMMARY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "headline": {"type": "string"},
+        # No minimum worth speaking of: a forty-second voice note does not
+        # contain four points, and a schema that insists on them makes the
+        # model invent one.
+        "bullets": {"type": "array", "items": {"type": "string"},
+                    "minItems": 1},
+    },
+    "required": ["headline", "bullets"],
+    "additionalProperties": False,
+}
+
+SUMMARY_SYSTEM = (
+    "You summarise transcripts of recordings: meetings, interviews, talks, "
+    "voice notes.\n\n"
+    "The headline is at most twelve words. It names the thing, it is not a "
+    "sentence about the thing, and it goes in a note's title bar where a long "
+    "one is cut off.\n\n"
+    "Then up to %d bullets, at most twenty-five words each, covering what "
+    "actually mattered: what was decided, claimed, asked for or agreed, and "
+    "any names, numbers and dates worth keeping. Where the transcript marks "
+    "who is speaking, say who said what.\n\n"
+    "Fewer bullets is better than padding. A short recording may hold only "
+    "one point, and a bullet saying that nothing was decided, or that no "
+    "figures were given, is worth nothing to anyone - leave it out.\n\n"
+    "Write both in %s, the language of the recording.\n\n"
+    "Do not open with \"This transcript\", \"The speaker\" or \"In this "
+    "recording\" - say the thing itself. Use no markdown, no asterisks and no "
+    "bullet characters: the headline and each bullet are plain text, and "
+    "punctuation inside them is fine.\n\n"
+    "A transcript is machine-made and may be garbled or cut short. Summarise "
+    "what is there and do not guess at what is missing."
+)
+
+
+class Summariser:
+    """A headline and a few bullets for a transcript, from the Claude API.
+
+    Written against urllib rather than the anthropic SDK for one reason: Chute
+    is one file with no dependencies, and it already speaks HTTP this way to
+    Telegram. Everything here is optional and off by default.
+    """
+
+    def __init__(self, data=None):
+        data = data or {}
+        for named in ("api_key", "key"):
+            if named in data:
+                raise ConfigError(
+                    "summary.%s does not exist, and a key does not belong in "
+                    "config.json. Put ANTHROPIC_API_KEY in service/.env "
+                    "instead. See \"Summaries\" in the README." % named)
+        self.enabled = data.get("enabled", False) is True
+        self.model = str(data.get("model") or "claude-opus-5").strip()
+        self.key_env = str(data.get("api_key_env") or "ANTHROPIC_API_KEY")
+        key_file = str(data.get("api_key_file") or "").strip()
+        self.key_file = Path(key_file).expanduser() if key_file else None
+        self.bullets = int(data.get("bullets") or 4)
+        if not 1 <= self.bullets <= 12:
+            raise ConfigError("summary.bullets must be between 1 and 12, got %r"
+                              % data.get("bullets"))
+        self.max_chars = int(data.get("max_chars") or 120000)
+        self.timeout = int(data.get("timeout") or 120)
+        self.base_url = str(data.get("base_url")
+                            or "https://api.anthropic.com").rstrip("/")
+        if not self.base_url.startswith(("https://", "http://localhost",
+                                         "http://127.0.0.1")):
+            raise ConfigError(
+                "summary.base_url must be https, or a proxy on this machine. "
+                "Transcripts are not sent in clear text over a network.")
+
+    def key(self):
+        """The API key, from the environment or a file. Never raises.
+
+        A file is the one that works under a service: launchd and systemd hand
+        a job almost no environment, so an exported variable that works from a
+        shell is silently absent once installed.
+        """
+        found = os.environ.get(self.key_env, "").strip()
+        if found:
+            return found
+        if self.key_file:
+            try:
+                return self.key_file.read_text(encoding="utf-8").strip()
+            except OSError:
+                return ""
+        return ""
+
+    def ready(self):
+        return bool(self.enabled and self.key())
+
+    def host(self):
+        return urllib.parse.urlsplit(self.base_url).netloc or self.base_url
+
+    def missing(self):
+        if not self.enabled or self.key():
+            return []
+        where = "%s in the environment" % self.key_env
+        if self.key_file:
+            where += ", or %s" % self.key_file
+        else:
+            where += ", or set summary.api_key_file"
+        return ["an API key from console.anthropic.com: %s" % where]
+
+    def body(self, text, language):
+        """The request, kept apart from sending it so a test can read it."""
+        return {
+            "model": self.model,
+            # Thinking is on by default on this model and this caps thinking
+            # and answer together, so a small number does not buy a short
+            # summary: it buys a truncated one that will not parse. A summary
+            # is a couple of hundred tokens; the rest is headroom.
+            "max_tokens": 4096,
+            "system": SUMMARY_SYSTEM % (self.bullets,
+                                        language or "the language spoken"),
+            "messages": [{"role": "user", "content": text[:self.max_chars]}],
+            # The schema is what makes this parseable rather than scraped: the
+            # headline arrives already apart from the bullets, which is what
+            # lets one line of it go into YAML frontmatter.
+            "output_config": {
+                "effort": "low",
+                "format": {"type": "json_schema", "schema": SUMMARY_SCHEMA},
+            },
+            "fallbacks": "default",
+        }
+
+    def post(self, body):
+        """One request, returning the parsed reply. The seam the tests fake."""
+        request = urllib.request.Request(
+            self.base_url + "/v1/messages",
+            data=json.dumps(body).encode("utf-8"),
+            headers={"content-type": "application/json",
+                     "x-api-key": self.key(),
+                     "anthropic-version": API_VERSION,
+                     "anthropic-beta": FALLBACK_BETA})
+        with urllib.request.urlopen(request, timeout=self.timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    def summarise(self, text, language=""):
+        """A (headline, bullets) for some words, or (None, []). Never raises.
+
+        A transcript nobody summarised is still the transcript. No key, no
+        network, an error from the API, a refusal, or an answer that is not the
+        shape the schema promised: each is logged in one line and the words are
+        written exactly as they always were.
+        """
+        if not (self.ready() and (text or "").strip()):
+            return None, []
+        try:
+            reply = self.post(self.body(text, language))
+            if reply.get("stop_reason") == "refusal":
+                detail = reply.get("stop_details") or {}
+                raise ValueError("declined (%s)"
+                                 % (detail.get("category") or "no reason given"))
+            if reply.get("stop_reason") == "max_tokens":
+                raise ValueError("the answer was cut off")
+            said = ""
+            for block in reply.get("content") or []:
+                if block.get("type") == "text":
+                    said = block.get("text") or ""
+                    break
+            found = json.loads(said)
+            headline = str(found["headline"]).strip()
+            bullets = [str(b).strip() for b in found["bullets"] if str(b).strip()]
+        except urllib.error.HTTPError as exc:
+            log("summary skipped: HTTP %s %s"
+                % (exc.code, api_error(exc) or exc.reason))
+            return None, []
+        except Exception as exc:
+            # Deliberately everything: http.client raises errors that are not
+            # OSError, and no summary is worth losing a finished transcript.
+            log("summary skipped: %s" % exc)
+            return None, []
+        if not headline:
+            log("summary skipped: nothing came back")
+            return None, []
+        return headline, bullets
+
+
+def api_error(exc):
+    """The message out of an API error body, if it says anything useful."""
+    try:
+        detail = json.loads(exc.read().decode("utf-8"))
+    except Exception:
+        return ""
+    return str((detail.get("error") or {}).get("message") or "")
+
+
+def summary_lines(headline, bullets):
+    """The summary as a block for the top of the note, above the words."""
+    if not headline:
+        return []
+    lines = ["", SUMMARY_HEADING, "", headline, ""]
+    return lines + ["- %s" % b for b in bullets] + [""] if bullets else lines
+
+
 # Every filed item has at most one note beside it, and a transcript is added
 # to that note rather than becoming a second one.
 TRANSCRIPT_HEADING = "## Transcript"
@@ -2010,9 +2247,15 @@ def transcript_body(segments, timestamps):
     return lines
 
 
-def transcript_section(segments, meta, timestamps=False):
-    """The transcript as a block to append to the note a file already has."""
-    lines = ["", TRANSCRIPT_HEADING, ""]
+def transcript_section(segments, meta, timestamps=False, summary=None):
+    """The transcript as a block to append to the note a file already has.
+
+    The summary, when there is one, rides at the front of the same string, so
+    it reaches a grown note and a brand-new one by the one path the words
+    already take.
+    """
+    lines = summary_lines(*(summary or (None, [])))
+    lines += ["", TRANSCRIPT_HEADING, ""]
     for key, label in (("title", "Source"), ("channel", "Channel"),
                        ("published", "Published"), ("language", "Language"),
                        ("duration", "Length"), ("speakers", "Speakers"),
@@ -2075,7 +2318,8 @@ def transcript_note(filename, meta, section, embed=False):
              "file: %s" % json.dumps(filename, ensure_ascii=False)]
     for key, value in (("transcript-language", meta.get("language")),
                        ("transcript-length", meta.get("duration")),
-                       ("transcript-speakers", meta.get("speakers"))):
+                       ("transcript-speakers", meta.get("speakers")),
+                       ("transcript-summary", meta.get("headline"))):
         if value:
             lines.append("%s: %s" % (key, json.dumps(str(value),
                                                      ensure_ascii=False)))
@@ -2186,7 +2430,15 @@ class Bot:
                 if self.cfg.transcribe.diarize_ready():
                     lines.append("When more than one person is talking, each "
                                  "of them is marked in the note.")
-                lines.append("Nothing is sent anywhere.")
+                # Said here because this is the one place a person reads
+                # rather than a config file they had to go looking for.
+                if self.cfg.summary.ready():
+                    lines.append("The words are then sent to Anthropic to be "
+                                 "summarised, and the summary goes at the top "
+                                 "of the note. Nothing else leaves the "
+                                 "computer: not the recording, not the file.")
+                else:
+                    lines.append("Nothing is sent anywhere.")
         lines += ["", "Names are date plus type, like <code>2026-08-20 1848 "
                       "Image.jpg</code>. A caption overrides that: caption a "
                       "photo <code>contract p3</code> and that is its "
@@ -2551,7 +2803,28 @@ class Bot:
             return self.transcript_failed(chat_id, message_id,
                                           "it went wrong: %s" % exc)
 
+        # Before the note is written, not after: the note is then written once
+        # and completely, and a second pass would append a duplicate
+        # transcript-summary line, since add_frontmatter only ever inserts.
         section = transcript_section(segments, meta, engine.timestamps)
+        summary = (None, [])
+        if self.cfg.summary.ready():
+            try:
+                progress("Summarising")
+                # The same block that goes in the note, so the model sees who
+                # was speaking and how long it ran. One renderer, one thing to
+                # keep right; the second call only puts the answer on top.
+                summary = self.cfg.summary.summarise(section,
+                                                     meta.get("language"))
+            except Exception as exc:
+                # summarise() swallows its own failures; this catches the chat
+                # edit beside it. The words are already won by here and a note
+                # that cannot be announced is still a note worth writing.
+                log("summary skipped: %s" % exc)
+            if summary[0]:
+                meta["headline"] = summary[0]
+                section = transcript_section(segments, meta,
+                                             engine.timestamps, summary)
         try:
             with self.lock:
                 live = self.live_record(chat_id, message_id)
@@ -2575,9 +2848,10 @@ class Bot:
             if not live:
                 self.note_history(cs, path, "text", "filed")
                 self.persist()
+                said = ("\n\n%s" % tg_escape(summary[0])) if summary[0] else ""
                 return self.tg.send(
-                    chat_id, "📝 Transcript in %s\n<code>%s</code>"
-                    % (meta["language"], rel_to(self.cfg.root, path)))
+                    chat_id, "📝 Transcript in %s\n<code>%s</code>%s"
+                    % (meta["language"], rel_to(self.cfg.root, path), said))
             live.pop("transcribing", None)
             live["transcript"] = True
             # The note grew and was renamed, so whatever record points at it
@@ -2602,8 +2876,17 @@ class Bot:
                 notes.append(sidecar_stat(kept, None))
                 self.note_history(cs, kept, "media", "filed")
             set_sidecars(live, notes)
-            text = self.filed_text(
-                live, note="📝 Transcript in %s" % meta["language"])
+            note = "📝 Transcript in %s" % meta["language"]
+            if summary[0]:
+                note += "\n\n%s" % tg_escape(summary[0])
+                # Enough of the points to be worth reading in the chat, and
+                # not so much that the message becomes the note.
+                for bullet in summary[1]:
+                    line = "\n• %s" % tg_escape(bullet)
+                    if len(note) + len(line) > 700:
+                        break
+                    note += line
+            text = self.filed_text(live, note=note)
             self.confirm(chat_id, cs, message_id, live, text)
             self.persist()
 
@@ -2626,7 +2909,8 @@ class Bot:
             meta["file"] = kept.name
         fields = [("transcript-language", meta.get("language")),
                   ("transcript-length", meta.get("duration")),
-                  ("transcript-speakers", meta.get("speakers"))]
+                  ("transcript-speakers", meta.get("speakers")),
+                  ("transcript-summary", meta.get("headline"))]
         stem = transcript_stem(base or Path(record["path"]).stem)
 
         def grow(note):
@@ -3490,6 +3774,7 @@ def cmd_setup(args):
 
 
 def cmd_check(args):
+    load_env_file()
     try:
         cfg = load_config(args.config)
     except ConfigError as exc:
@@ -3532,6 +3817,16 @@ def cmd_check(args):
     elif tr.diarize_on:
         print("Names:  asked for, but nothing will be marked")
         for gap in tr.diarize_missing():
+            print("  needs %s" % gap)
+    sm = cfg.summary
+    # Named rather than described, because check is where someone looks to
+    # find out what this thing does with their files.
+    if sm.ready():
+        print("Sent:   %s, so transcripts go to %s"
+              % (sm.model, sm.host()))
+    elif sm.enabled:
+        print("Sent:   asked for, but nothing will be summarised")
+        for gap in sm.missing():
             print("  needs %s" % gap)
     if cfg.local_api:
         print("Server: %s  (your own, so no 20 MB download limit)"
@@ -3596,6 +3891,7 @@ def cmd_logout(args):
 
 
 def cmd_run(args):
+    load_env_file()
     cfg = load_config(args.config)
     cfg.validate_paths()
     acquire_lock()

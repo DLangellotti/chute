@@ -1,4 +1,5 @@
 config.json
+config.json.*
 # api_id and api_hash for a self-hosted Bot API server. These
 # belong to the Telegram account, not just the bot.
 .env

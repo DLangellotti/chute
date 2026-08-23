@@ -46,5 +46,8 @@
     "max_minutes": 240,
     "youtube_captions": "manual",
     "diarize": false
+  },
+  "summary": {
+    "enabled": false
   }
 }
