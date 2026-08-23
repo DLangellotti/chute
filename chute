@@ -110,18 +110,18 @@ IN TELEGRAM
 
   Everything you send is filed on arrival. The buttons on each reply move
   that file to another folder, or delete it. A voice note, a media file or a
-  YouTube link also gets a Transcribe button; see README.md.
+  YouTube link also gets a Transcribe button; see SETTINGS.md.
 
 SPEAKERS AND SUMMARIES
   Install a diarizer and each speaker is marked in the transcript; see
-  examples/diarize and "Who is speaking" in README.md.
+  examples/diarize and "Who is speaking" in SETTINGS.md.
 
   Summaries are the one thing Chute sends anywhere, and are off until you
   set summary.enabled. The API key goes in service/.env as
   ANTHROPIC_API_KEY, never in config.json. "check" says whether it was
   found, and says out loud that transcripts will be sent.
 
-Docs: README.md    Threat model: SECURITY.md
+Docs: README.md, SETTINGS.md    Threat model: SECURITY.md
 CHUTE_HELP
 }
 

@@ -1692,8 +1692,8 @@ class Transcriber:
         """
         if not self.diarize_on or self.diarizer:
             return []
-        return ["a diarizer that writes RTTM. See \"Who is speaking\" in the "
-                "README"]
+        return ["a diarizer that writes RTTM. See \"Who is speaking\" in "
+                "SETTINGS.md"]
 
     def youtube_ready(self):
         if not (self.enabled and self.ytdlp):
@@ -2074,7 +2074,7 @@ class Summariser:
                 raise ConfigError(
                     "summary.%s does not exist, and a key does not belong in "
                     "config.json. Put ANTHROPIC_API_KEY in service/.env "
-                    "instead. See \"Summaries\" in the README." % named)
+                    "instead. See \"Summaries\" in SETTINGS.md." % named)
         self.enabled = data.get("enabled", False) is True
         self.model = str(data.get("model") or "claude-opus-5").strip()
         self.key_env = str(data.get("api_key_env") or "ANTHROPIC_API_KEY")

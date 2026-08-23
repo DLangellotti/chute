@@ -5,7 +5,7 @@
 #   $2  where to write the RTTM it reads back
 #
 # Copy this to somewhere on your PATH, chmod +x it, and fetch the two models
-# it names. See "Who is speaking" in the README.
+# it names. See "Who is speaking" in SETTINGS.md.
 #
 # sherpa-onnx is about 45 MB of ONNX models with no PyTorch, no account and
 # no token, which is why it is the one documented here. Anything that writes
